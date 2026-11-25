@@ -20,7 +20,13 @@ import android.text.InputType
 import android.text.TextUtils
 import android.text.TextWatcher
 import android.util.Rational
+import android.transition.ChangeBounds
+import android.transition.Slide
+import android.transition.TransitionManager
+import android.transition.TransitionSet
 import android.view.Gravity
+import android.view.MotionEvent
+import android.view.accessibility.AccessibilityManager
 import android.view.KeyEvent
 import android.view.PixelCopy
 import android.view.View
@@ -65,6 +71,11 @@ class MainActivity : Activity(), BrowserSession.Events {
     private lateinit var reload: ImageButton
     private lateinit var progress: ProgressBar
     private lateinit var noticeBar: LinearLayout
+    private lateinit var bars: List<View>
+    private var barsHidden = false
+    /** Where the finger was, and how far it has moved in one direction. */
+    private var touchY = 0f
+    private var travel = 0f
     private lateinit var noticeText: TextView
     private lateinit var noticeOpen: View
     private val main = Handler(Looper.getMainLooper())
@@ -102,10 +113,9 @@ class MainActivity : Activity(), BrowserSession.Events {
             isFocusableInTouchMode = true
             setBackgroundColor(getColor(R.color.panel))
         }
-        browser = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            addView(topBar())
-        }
+        browser = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        bars = listOf(topBar(), addressBar())
+        browser.addView(bars[0])
         val page = FrameLayout(this)
         webHost = FrameLayout(this)
         emptyPage = startPage()
@@ -120,7 +130,7 @@ class MainActivity : Activity(), BrowserSession.Events {
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
         }
         browser.addView(progress, LinearLayout.LayoutParams(-1, dp(2)))
-        browser.addView(addressBar())
+        browser.addView(bars[1])
 
         overview = TabOverview(
             this, session,
@@ -319,8 +329,45 @@ class MainActivity : Activity(), BrowserSession.Events {
         addView(noticeOpen)
     }
 
+    /**
+     * The bars slide away while the reader scrolls down and come back on the first bit of scrolling up.
+     * This follows the finger, not the page position: hiding the bars resizes the page, which shifts
+     * the position too and would bring the bars straight back at the end of a page.
+     */
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+            touchY = event.rawY
+            travel = 0f
+        } else if (event.actionMasked == MotionEvent.ACTION_MOVE && !showingTabs && !inFullscreen) {
+            val step = event.rawY - touchY
+            touchY = event.rawY
+            travel = if ((step > 0) == (travel > 0)) travel + step else step
+            val scrolled = session.activeView.scrollY
+            // Further down than the bars are tall: the page grows by their height when they go, and a
+            // short page must not land back at the top, where they return.
+            if (travel > dp(8) || scrolled == 0) hideBars(false)
+            else if (travel < -dp(40) && scrolled > bars.sumOf { it.height } && !address.hasFocus()) hideBars(true)
+        }
+        return super.dispatchTouchEvent(event)
+    }
+
+    private fun hideBars(hide: Boolean) {
+        // TalkBack needs the buttons in reach.
+        if (hide == barsHidden || hide && getSystemService(AccessibilityManager::class.java).isTouchExplorationEnabled) return
+        barsHidden = hide
+        TransitionManager.beginDelayedTransition(
+            browser,
+            TransitionSet().setDuration(220)
+                .addTransition(Slide(Gravity.TOP).addTarget(bars[0]))
+                .addTransition(Slide(Gravity.BOTTOM).addTarget(bars[1]))
+                .addTransition(ChangeBounds()),
+        )
+        for (bar in bars) bar.visibility = if (hide) View.GONE else View.VISIBLE
+    }
+
     override fun pageChanged() {
         if (wiping || isDestroyed) return
+        if (session.current.progress < 100) hideBars(false)   // a new page starts with the bars
         val active = session.activeView
         if (active.parent !== webHost) {
             webHost.removeAllViews()

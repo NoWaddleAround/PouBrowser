@@ -33,16 +33,30 @@ struct ContentView: View {
                 if let notice = browser.notice { noticeRow(notice) }
             }
             .animation(.default, value: browser.notice)
-            .safeAreaInset(edge: .top, spacing: 0) { topBar }
-            .safeAreaInset(edge: .bottom, spacing: 0) {
+            // The empty stacks stay as the coloured strips behind the status bar and the home indicator.
+            .safeAreaInset(edge: .top, spacing: 0) {
                 VStack(spacing: 0) {
-                    ProgressView(value: browser.progress)
-                        .opacity(browser.isLoading ? 1 : 0)
-                        .accessibilityHidden(!browser.isLoading)
-                    bar
+                    if !hidesBars { topBar.transition(.move(edge: .top).combined(with: .opacity)) }
                 }
+                .frame(maxWidth: .infinity)
                 .background(.bar)
             }
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                VStack(spacing: 0) {
+                    if !hidesBars {
+                        VStack(spacing: 0) {
+                            ProgressView(value: browser.progress)
+                                .opacity(browser.isLoading ? 1 : 0)
+                                .accessibilityHidden(!browser.isLoading)
+                            bar
+                        }
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                    }
+                }
+                .frame(maxWidth: .infinity)
+                .background(.bar)
+            }
+            .animation(.easeOut(duration: 0.25), value: hidesBars)
             .onChange(of: browser.address, initial: true) { showAddress() }
             .onChange(of: editing) { showAddress() }
             .fullScreenCover(isPresented: $showsTabs, onDismiss: focusNewTab) {
@@ -61,6 +75,9 @@ struct ContentView: View {
             }
             .task { await session.blocker.start() }
     }
+
+    /// While reading down a page the bars are out of the way. Typing an address and the start page keep them.
+    private var hidesBars: Bool { browser.barsHidden && !editing && browser.url != nil }
 
     /// Site name while reading, full address while editing.
     private func showAddress() {
@@ -107,7 +124,6 @@ struct ContentView: View {
                 }
         }
         .padding(.horizontal, 8)
-        .background(.bar)
     }
 
     private var bar: some View {

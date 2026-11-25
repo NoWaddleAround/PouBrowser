@@ -51,6 +51,12 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate {
     /// Where the user's finger last left the page. Only finger scrolling counts: WebKit resets the
     /// offset by itself when the page's process goes away.
     @ObservationIgnored private(set) var scrollY = 0.0
+    /// The bars slide away while the reader scrolls down and come back on the first bit of scrolling up.
+    private(set) var barsHidden = false
+    /// How far the finger has scrolled in one direction, and when the bars last moved.
+    @ObservationIgnored private var travel = 0.0
+    @ObservationIgnored private var lastY = 0.0
+    @ObservationIgnored private var barsMoved = Date.distantPast
     /// Reading position to return to once the reloading page has finished.
     @ObservationIgnored private var pendingScroll: Double?
     /// A tab restored at launch loads only when the user comes to it.
@@ -301,7 +307,7 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate {
             watch(view, \.canGoForward) { $0.canGoForward = $1 },
             view.scrollView.observe(\.contentOffset) { [weak self] scroll, _ in
                 MainActor.assumeIsolated {
-                    if scroll.isDragging || scroll.isDecelerating { self?.scrollY = scroll.contentOffset.y }
+                    self?.moveBars(with: scroll)
                 }
             },
         ]
@@ -481,7 +487,38 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate {
         return Self.allowInBrowser
     }
 
+    /// Only the finger counts, and not the moment after the bars moved: the page changes size then,
+    /// which shifts the position too and would bring the bars straight back at the end of a page.
+    private func moveBars(with scroll: UIScrollView) {
+        let y = scroll.contentOffset.y
+        let step = y - lastY
+        lastY = y
+        if scroll.isDragging || scroll.isDecelerating { scrollY = y }   // the reading position, kept for the way back
+        guard y > 0 else { return showBars() }
+        guard scroll.isDragging, barsMoved.timeIntervalSinceNow < -0.4 else {
+            travel = 0
+            return
+        }
+        travel = (step > 0) == (travel > 0) ? travel + step : step
+        if travel < -8 {
+            showBars()
+        } else if travel > 40, y > 150, !barsHidden, !UIAccessibility.isVoiceOverRunning {
+            // Further down than the bars are tall: the page grows by their height when they go, and a
+            // short page must not land back at the top, where they return. VoiceOver keeps the buttons in reach.
+            barsHidden = true
+            barsMoved = .now
+        }
+    }
+
+    private func showBars() {
+        travel = 0
+        guard barsHidden else { return }
+        barsHidden = false
+        barsMoved = .now
+    }
+
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        showBars()
         // Server redirects never arrive here, new navigations do. One that got through above as a
         // "redirect" of the user's load is a script hijacking that load.
         if loading && last.cross && !last.user {
