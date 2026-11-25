@@ -1,5 +1,8 @@
 (() => {
     if (location.protocol !== 'https:' && location.protocol !== 'http:') return;
+    // Global Privacy Control signal.
+    try { Object.defineProperty(navigator, 'globalPrivacyControl', { get: () => true, configurable: true }); } catch (_) {}
+
     // Tells the app which link or form the finger is on, so it can tell a tapped link from a script
     // that sends the tab elsewhere during the same tap. Sent at touch time, well before the navigation.
     // The reporting object is taken off the page so page scripts cannot vouch for their own redirects.

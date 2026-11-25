@@ -31,6 +31,16 @@ struct TabOverview: View {
                 .background(Color(uiColor: .systemGroupedBackground))
                 .navigationTitle("Tabs")
                 .toolbar {
+                    if !session.closedTabs.isEmpty {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button {
+                                session.reopenClosedTab()
+                                dismiss()
+                            } label: {
+                                Label(L("Tab wiederherstellen", "Reopen closed tab"), systemImage: "arrow.uturn.backward")
+                            }
+                        }
+                    }
                     ToolbarItem(placement: .confirmationAction) {
                         Button(L("Fertig", "Done")) { dismiss() }
                     }
@@ -40,7 +50,7 @@ struct TabOverview: View {
                         onNewTab()
                         dismiss()
                     } label: {
-                        Label("Neuer Tab", systemImage: "plus")
+                        Label(L("Neuer Tab", "New tab"), systemImage: "plus")
                             .font(.body.weight(.semibold))
                             .padding(.horizontal, 14)
                             .frame(minHeight: 44)
@@ -124,7 +134,7 @@ private struct TabCard: View {
         Color(uiColor: .tertiarySystemFill)
             .aspectRatio(4 / 3, contentMode: .fit)
             .overlay {
-                if let data = tab.preview, let image = UIImage(data: data) {
+                if let image = tab.previewImage {
                     Image(uiImage: image)
                         .resizable()
                         .scaledToFill()

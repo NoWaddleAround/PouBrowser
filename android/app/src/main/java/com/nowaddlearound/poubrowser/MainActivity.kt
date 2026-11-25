@@ -5,6 +5,8 @@ import android.app.Activity
 import android.app.AlertDialog
 import android.app.PictureInPictureParams
 import android.app.PictureInPictureUiState
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Configuration
@@ -19,21 +21,22 @@ import android.text.Editable
 import android.text.InputType
 import android.text.TextUtils
 import android.text.TextWatcher
-import android.util.Rational
 import android.transition.ChangeBounds
 import android.transition.Slide
 import android.transition.TransitionManager
 import android.transition.TransitionSet
+import android.util.Rational
 import android.view.Gravity
-import android.view.MotionEvent
-import android.view.accessibility.AccessibilityManager
 import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.PixelCopy
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
+import android.view.accessibility.AccessibilityManager
 import android.view.inputmethod.EditorInfo
 import android.webkit.WebChromeClient
+import android.webkit.WebView
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageButton
@@ -63,6 +66,10 @@ class MainActivity : Activity(), BrowserSession.Events {
     private lateinit var pipButton: View
     private lateinit var exitFullscreenButton: View
     private lateinit var address: EditText
+    private lateinit var findBar: LinearLayout
+    private lateinit var findInput: EditText
+    private lateinit var findCount: TextView
+    private var findingView: WebView? = null
     private lateinit var tabCount: TextView
     private lateinit var tabSwitcher: View
     private lateinit var cancelAddress: View
@@ -105,7 +112,24 @@ class MainActivity : Activity(), BrowserSession.Events {
         if (Build.VERSION.SDK_INT >= 33) {
             onBackInvokedDispatcher.registerOnBackInvokedCallback(OnBackInvokedDispatcher.PRIORITY_DEFAULT, ::handleBack)
         }
+        if (state == null) handleIncomingIntent(intent)
         pageChanged()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (!wiping) {
+            showingTabs = false
+            syncLayers()
+            handleIncomingIntent(intent)
+        }
+    }
+
+    private fun handleIncomingIntent(intent: Intent?) {
+        if (intent?.action == Intent.ACTION_VIEW) {
+            session.openExternal(intent.dataString)
+        }
     }
 
     private fun buildScreen() {
@@ -116,6 +140,7 @@ class MainActivity : Activity(), BrowserSession.Events {
         browser = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         bars = listOf(topBar(), addressBar())
         browser.addView(bars[0])
+        browser.addView(makeFindBar())
         val page = FrameLayout(this)
         webHost = FrameLayout(this)
         emptyPage = startPage()
@@ -137,6 +162,7 @@ class MainActivity : Activity(), BrowserSession.Events {
             onSelect = { tab ->
                 showingTabs = false
                 clearNotice()
+                closeFindBar()
                 session.select(tab)
                 syncLayers()
             },
@@ -148,9 +174,17 @@ class MainActivity : Activity(), BrowserSession.Events {
             onNew = {
                 showingTabs = false
                 clearNotice()
+                closeFindBar()
                 session.newTab()
                 syncLayers()
                 address.post { focusAddress() }
+            },
+            onReopen = {
+                showingTabs = false
+                clearNotice()
+                closeFindBar()
+                session.reopenClosedTab()
+                syncLayers()
             },
             onDone = ::closeOverview,
         )
@@ -200,6 +234,78 @@ class MainActivity : Activity(), BrowserSession.Events {
         addView(icon(R.drawable.ic_clear, L("Alles löschen", "Clear everything")) { confirmWipe() }, barItem)
     }
 
+    private fun makeFindBar() = LinearLayout(this).apply {
+        findBar = this
+        gravity = Gravity.CENTER_VERTICAL
+        setPadding(dp(8), dp(2), dp(8), dp(6))
+        setBackgroundColor(getColor(R.color.panel))
+        visibility = View.GONE
+
+        val field = LinearLayout(this@MainActivity).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            background = rounded(getColor(R.color.field), 12)
+        }
+        findInput = EditText(this@MainActivity).apply {
+            background = null
+            hint = L("Auf der Seite suchen", "Find on page")
+            textSize = 15f
+            setHintTextColor(getColor(R.color.muted))
+            setTextColor(getColor(R.color.ink))
+            inputType = InputType.TYPE_CLASS_TEXT
+            imeOptions = EditorInfo.IME_ACTION_SEARCH or EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING
+            setSingleLine(true)
+            setPadding(dp(12), 0, dp(8), 0)
+            setOnEditorActionListener { _, action, _ ->
+                if (action == EditorInfo.IME_ACTION_SEARCH) {
+                    session.activeView.findNext(true)
+                    true
+                } else false
+            }
+            addTextChangedListener(object : TextWatcher {
+                override fun beforeTextChanged(text: CharSequence?, start: Int, count: Int, after: Int) = Unit
+                override fun onTextChanged(text: CharSequence?, start: Int, before: Int, count: Int) = Unit
+                override fun afterTextChanged(text: Editable?) {
+                    val query = text?.toString().orEmpty()
+                    if (query.isEmpty()) {
+                        session.activeView.clearMatches()
+                        findCount.text = ""
+                    } else {
+                        session.activeView.findAllAsync(query)
+                    }
+                }
+            })
+        }
+        findCount = label("", 13f, R.color.muted).apply {
+            fontFeatureSettings = "'tnum'"
+            setPadding(0, 0, dp(10), 0)
+        }
+        field.addView(findInput, LinearLayout.LayoutParams(0, dp(42), 1f))
+        field.addView(findCount, LinearLayout.LayoutParams(-2, -2))
+        addView(field, LinearLayout.LayoutParams(0, -2, 1f))
+        addView(icon(R.drawable.ic_up, L("Vorheriger Treffer", "Previous match")) { session.activeView.findNext(false) }, barItem)
+        addView(icon(R.drawable.ic_down, L("Nächster Treffer", "Next match")) { session.activeView.findNext(true) }, barItem)
+        addView(icon(R.drawable.ic_close, L("Suche schließen", "Close search")) { closeFindBar() }, barItem)
+    }
+
+    private fun openFindBar() {
+        if (session.current.address == null) return
+        hideBars(false)
+        findBar.visibility = View.VISIBLE
+        val query = findInput.text.toString()
+        if (query.isNotEmpty()) session.activeView.findAllAsync(query)
+        findInput.requestFocus()
+        findInput.selectAll()
+        WindowCompat.getInsetsController(window, findInput).show(WindowInsetsCompat.Type.ime())
+    }
+
+    private fun closeFindBar() {
+        if (findBar.visibility != View.VISIBLE) return
+        findBar.visibility = View.GONE
+        findingView?.clearMatches()
+        WindowCompat.getInsetsController(window, findInput).hide(WindowInsetsCompat.Type.ime())
+        root.requestFocus()
+    }
+
     private fun fullscreenIcon(symbol: Int, title: String, action: () -> Unit) = icon(symbol, title) { action() }.apply {
         background = pressable(0xD923302D.toInt(), 24)
         setColorFilter(Color.WHITE)
@@ -241,6 +347,7 @@ class MainActivity : Activity(), BrowserSession.Events {
                 val entered = text.toString()
                 endEditing()
                 clearNotice()
+                closeFindBar()
                 session.openInput(entered)
                 true
             }
@@ -338,7 +445,7 @@ class MainActivity : Activity(), BrowserSession.Events {
         if (event.actionMasked == MotionEvent.ACTION_DOWN) {
             touchY = event.rawY
             travel = 0f
-        } else if (event.actionMasked == MotionEvent.ACTION_MOVE && !showingTabs && !inFullscreen) {
+        } else if (event.actionMasked == MotionEvent.ACTION_MOVE && !showingTabs && !inFullscreen && findBar.visibility != View.VISIBLE) {
             val step = event.rawY - touchY
             touchY = event.rawY
             travel = if ((step > 0) == (travel > 0)) travel + step else step
@@ -369,12 +476,23 @@ class MainActivity : Activity(), BrowserSession.Events {
         if (wiping || isDestroyed) return
         if (session.current.progress < 100) hideBars(false)   // a new page starts with the bars
         val active = session.activeView
+        if (findingView !== active) {
+            findingView?.setFindListener(null)
+            findingView = active
+            active.setFindListener { activeOrdinal, count, done ->
+                if (!done) return@setFindListener
+                findCount.text = if (findInput.text.isEmpty()) ""
+                else if (count == 0) "0/0"
+                else "${activeOrdinal + 1}/$count"
+            }
+        }
         if (active.parent !== webHost) {
             webHost.removeAllViews()
             (active.parent as? ViewGroup)?.removeView(active)
             webHost.addView(active, fillFrame)
         }
         emptyPage.visibility = if (session.current.address == null) View.VISIBLE else View.GONE
+        if (session.current.address == null) closeFindBar()
         if (!address.hasFocus() && address.text.toString() != session.current.host.orEmpty())
             address.setText(session.current.host.orEmpty())
         back.isEnabled = active.canGoBack()
@@ -397,6 +515,39 @@ class MainActivity : Activity(), BrowserSession.Events {
         noticeBar.visibility = View.VISIBLE
         main.removeCallbacks(hideNotice)
         main.postDelayed(hideNotice, 6500)
+    }
+
+    override fun showLinkActions(url: HttpUrl) {
+        if (wiping || isDestroyed) return
+        val cleaned = BrowserPolicy.cleanUrl(url)
+        val options = arrayOf(
+            L("In neuem Tab öffnen", "Open in new tab"),
+            L("Im Hintergrund öffnen", "Open in background"),
+            L("Link kopieren", "Copy link"),
+            L("Link teilen", "Share link"),
+        )
+        AlertDialog.Builder(this)
+            .setTitle(cleaned.host)
+            .setItems(options) { _, which ->
+                when (which) {
+                    0 -> session.openInNewTab(cleaned, inBackground = false)
+                    1 -> session.openInNewTab(cleaned, inBackground = true)
+                    2 -> {
+                        getSystemService(ClipboardManager::class.java)
+                            ?.setPrimaryClip(ClipData.newPlainText("URL", cleaned.toString()))
+                        notice(L("Link kopiert", "Link copied"))
+                    }
+                    3 -> shareUrl(cleaned.toString(), cleaned.host)
+                }
+            }
+            .show()
+    }
+
+    private fun shareUrl(url: String, title: String?) {
+        val share = Intent(Intent.ACTION_SEND).setType("text/plain")
+            .putExtra(Intent.EXTRA_TEXT, url)
+        if (!title.isNullOrBlank()) share.putExtra(Intent.EXTRA_SUBJECT, title)
+        startActivity(Intent.createChooser(share, L("Teilen", "Share")))
     }
 
     private fun clearNotice() {
@@ -436,6 +587,7 @@ class MainActivity : Activity(), BrowserSession.Events {
     private fun openOverview() {
         if (openingTabs || showingTabs || wiping) return
         endEditing()
+        closeFindBar()
         openingTabs = true
         val request = ++overviewRequest
         val tab = session.current
@@ -492,13 +644,21 @@ class MainActivity : Activity(), BrowserSession.Events {
         if (wiping) return
         PopupMenu(this, anchor).apply {
             val url = session.current.address
-            if (url != null) menu.add(0, 1, 0, L("JavaScript auf dieser Seite", "JavaScript on this site")).apply {
-                isCheckable = true
-                isChecked = session.scriptsAllowed(url)
-            }
-            if (url != null) menu.add(0, 5, 0, L("Werbeblocker auf dieser Seite", "Ad blocker on this site")).apply {
-                isCheckable = true
-                isChecked = session.filteringAllowed(url)
+            if (url != null) {
+                menu.add(0, 7, 0, L("Seite teilen", "Share page"))
+                menu.add(0, 8, 0, L("Auf der Seite suchen", "Find on page"))
+                menu.add(0, 1, 0, L("JavaScript auf dieser Seite", "JavaScript on this site")).apply {
+                    isCheckable = true
+                    isChecked = session.scriptsAllowed(url)
+                }
+                menu.add(0, 5, 0, L("Werbeblocker auf dieser Seite", "Ad blocker on this site")).apply {
+                    isCheckable = true
+                    isChecked = session.filteringAllowed(url)
+                }
+                menu.add(0, 9, 0, L("Desktop-Webseite", "Desktop site")).apply {
+                    isCheckable = true
+                    isChecked = session.desktopAllowed(url)
+                }
             }
             menu.add(0, 6, 0, L("Seiten abdunkeln", "Darken pages")).apply {
                 isCheckable = true
@@ -524,6 +684,9 @@ class MainActivity : Activity(), BrowserSession.Events {
                     }
                     5 -> session.toggleFiltering()
                     6 -> session.darkPages = !session.darkPages
+                    7 -> session.current.address?.let { page -> shareUrl(page.toString(), session.current.title) }
+                    8 -> openFindBar()
+                    9 -> session.toggleDesktop()
                     4 -> {
                         val share = Intent(Intent.ACTION_SEND).setType("text/plain")
                             .putExtra(Intent.EXTRA_TEXT, session.log)
@@ -547,6 +710,7 @@ class MainActivity : Activity(), BrowserSession.Events {
             .setNegativeButton(L("Abbrechen", "Cancel"), null)
             .setPositiveButton(L("Alles löschen", "Clear everything")) { _, _ ->
                 clearNotice()
+                closeFindBar()
                 wiping = true
                 browser.isEnabled = false
                 browser.visibility = View.GONE
@@ -574,6 +738,7 @@ class MainActivity : Activity(), BrowserSession.Events {
             return
         }
         endEditing()
+        closeFindBar()
         openingTabs = false
         showingTabs = false
         fullscreenCallback = callback
@@ -672,6 +837,7 @@ class MainActivity : Activity(), BrowserSession.Events {
         when {
             inFullscreen -> hideFullscreen()
             showingTabs -> closeOverview()
+            findBar.visibility == View.VISIBLE -> closeFindBar()
             address.hasFocus() -> endEditing()
             session.goBack() -> clearNotice()
             else -> finish()
@@ -696,6 +862,8 @@ class MainActivity : Activity(), BrowserSession.Events {
 
     override fun onDestroy() {
         main.removeCallbacksAndMessages(null)
+        findingView?.setFindListener(null)
+        findingView = null
         hideFullscreen()
         session.destroy()
         super.onDestroy()

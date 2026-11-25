@@ -9,27 +9,43 @@ import okhttp3.HttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONObject
+import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
 import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.io.DataInputStream
+import java.io.DataOutputStream
 import java.io.File
 import java.io.IOException
+import java.security.MessageDigest
+import java.util.concurrent.Callable
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * The ad blocker: downloads the filter lists the iOS app uses, keeps them as a [FilterEngine], drops
- * matching requests and builds the scripts that hide ad areas and defuse ad scripts inside pages.
+ * The ad blocker: downloads the filter lists the iOS app uses, keeps them as a [FilterEngine]
+ * (backed by a binary snapshot on disk for fast cold launches), drops matching requests and builds
+ * the scripts that hide ad areas and defuse ad scripts inside pages.
  */
 internal class TrackerBlocker(private val context: Context) {
     private class FilterList(val name: String, val days: Long, vararg val addresses: String)
 
     private val folder = File(context.filesDir, "filters")
+    private val rawFolder = File(folder, "raw")
+    private val cacheFile = File(folder, "engine.bin")
     private val preferences = context.getSharedPreferences("tracker-filter", Context.MODE_PRIVATE)
     private val worker = Executors.newSingleThreadExecutor()
     private val busy = AtomicBoolean()
     private val client = OkHttpClient.Builder()
-        .followRedirects(false)
+        .followRedirects(true)
+        .followSslRedirects(false)
+        .addNetworkInterceptor { chain ->
+            val request = chain.request()
+            if (!request.url.isHttps) throw IOException("HTTPS required")
+            chain.proceed(request)
+        }
         .callTimeout(40, TimeUnit.SECONDS)
         .build()
 
@@ -114,17 +130,31 @@ internal class TrackerBlocker(private val context: Context) {
         (from == null || exemptions(from) and FilterEngine.EXEMPT_ALL == 0) &&
             engine.blocksPage(to.toString(), to.host, from?.host)
 
-    /** The scripts for a page, each with the origins it runs on: hide-everywhere styles for all frames, the rest for the page itself. */
-    fun pageScripts(page: HttpUrl): List<Pair<String, Set<String>>> {
+    /**
+     * Global hide-everywhere CSS script (`setOf("*")`) shared across cross-site navigations, plus
+     * per-page override state so standard pages do not re-register 1+ MB of CSS over JNI on every click.
+     */
+    class ScriptPlan(
+        val useWildcardGeneric: Boolean,
+        val customGenericOriginScript: String?,
+        val originPageScript: String?,
+    )
+
+    fun planScripts(page: HttpUrl): ScriptPlan {
         val exempt = exemptions(page)
-        if (exempt and (FilterEngine.EXEMPT_ALL or FilterEngine.EXEMPT_COSMETIC) != 0) return emptyList()
-        val scripts = ArrayList<Pair<String, Set<String>>>()
-        if (exempt and FilterEngine.EXEMPT_GENERIC == 0) {
-            val own = engine.genericCssFor(page.host)
-            scripts.add((if (own != null) styleScript(own) else genericScript()) to setOf("*"))
+        if (exempt and (FilterEngine.EXEMPT_ALL or FilterEngine.EXEMPT_COSMETIC) != 0) {
+            return ScriptPlan(useWildcardGeneric = false, customGenericOriginScript = null, originPageScript = null)
         }
-        frameScript(page)?.let { scripts.add(it to setOf(origin(page))) }
-        return scripts
+        val hostRules = frameScript(page)
+        if (exempt and FilterEngine.EXEMPT_GENERIC != 0) {
+            return ScriptPlan(useWildcardGeneric = false, customGenericOriginScript = null, originPageScript = hostRules)
+        }
+        val ownGeneric = engine.genericCssFor(page.host)
+        return if (ownGeneric != null) {
+            ScriptPlan(useWildcardGeneric = false, customGenericOriginScript = styleScript(ownGeneric), originPageScript = hostRules)
+        } else {
+            ScriptPlan(useWildcardGeneric = true, customGenericOriginScript = null, originPageScript = hostRules)
+        }
     }
 
     /** Scriptlets and styles for one document, or null when no rule names its host. */
@@ -154,7 +184,7 @@ internal class TrackerBlocker(private val context: Context) {
 
     private var genericFor = -1
     private var generic = ""
-    @Synchronized private fun genericScript(): String {
+    @Synchronized fun genericScript(): String {
         if (genericFor != version) {
             generic = styleScript(engine.genericCss)
             genericFor = version
@@ -180,7 +210,7 @@ internal class TrackerBlocker(private val context: Context) {
         worker.execute {
             try {
                 if (ready.count > 0) {
-                    load()
+                    load(rebuildCache = false)
                     opened()
                 }
                 val now = System.currentTimeMillis()
@@ -190,8 +220,26 @@ internal class TrackerBlocker(private val context: Context) {
                 }
                 if (due.isEmpty()) return@execute
                 status = L("Filterlisten werden geladen …", "Loading filter lists …")
-                val failed = due.filterNot(::download)
-                load()
+
+                val pool = Executors.newFixedThreadPool(minOf(due.size, 3))
+                val results = try {
+                    pool.invokeAll(due.map { list -> Callable { list to download(list, allowNotModified = !force && file(list).exists()) } })
+                        .map { it.get() }
+                } finally {
+                    pool.shutdown()
+                }
+
+                val failed = ArrayList<FilterList>()
+                var anyChanged = false
+                for ((list, outcome) in results) {
+                    when (outcome) {
+                        DownloadOutcome.CHANGED -> anyChanged = true
+                        DownloadOutcome.NOT_MODIFIED -> Unit
+                        DownloadOutcome.FAILED -> failed.add(list)
+                    }
+                }
+                if (anyChanged || version == 0) load(rebuildCache = true)
+                else updateStatusFromCurrentEngine()
                 if (failed.isNotEmpty()) status += L(" · Aktualisierung fehlgeschlagen: ", " · Update failed: ") + failed.joinToString { it.name }
             } finally {
                 opened()
@@ -200,38 +248,93 @@ internal class TrackerBlocker(private val context: Context) {
         }
     }
 
+    private enum class DownloadOutcome { CHANGED, NOT_MODIFIED, FAILED }
+
     private fun file(list: FilterList) = File(folder, list.name + ".txt")
 
-    private fun download(list: FilterList): Boolean = try {
-        val data = java.io.ByteArrayOutputStream()
+    private fun rawPartFile(address: String): File {
+        val digest = MessageDigest.getInstance("SHA-256").digest(address.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+        return File(rawFolder, "$digest.txt")
+    }
+
+    private fun download(list: FilterList, allowNotModified: Boolean): DownloadOutcome = try {
+        rawFolder.mkdirs()
+        val data = ByteArrayOutputStream()
+        var anyPartChanged = !allowNotModified
         for (address in list.addresses) {
-            client.newCall(Request.Builder().url(address).build()).execute().use { response ->
+            val partCache = rawPartFile(address)
+            val requestBuilder = Request.Builder().url(address)
+            if (allowNotModified && partCache.exists()) {
+                preferences.getString("etag.$address", null)?.let { requestBuilder.header("If-None-Match", it) }
+                preferences.getString("lastmod.$address", null)?.let { requestBuilder.header("If-Modified-Since", it) }
+            }
+            client.newCall(requestBuilder.build()).execute().use { response ->
+                if (response.code == 304 && partCache.exists()) {
+                    data.write(partCache.readBytes())
+                    data.write('\n'.code)
+                    return@use
+                }
                 val body = response.body
                 if (!response.isSuccessful || body == null) throw IOException("HTTP " + response.code)
                 val buffer = body.source()
                 if (buffer.request(maxBytes + 1)) throw IOException(L("Filterdatei zu groß", "Filter file too large"))
-                data.write(buffer.readByteArray())
+                val bytes = buffer.readByteArray()
+                anyPartChanged = true
+                runCatching { partCache.writeBytes(bytes) }
+                val editor = preferences.edit()
+                response.header("ETag")?.let { editor.putString("etag.$address", it) }
+                response.header("Last-Modified")?.let { editor.putString("lastmod.$address", it) }
+                editor.apply()
+                data.write(bytes)
                 data.write('\n'.code)
             }
         }
-        folder.mkdirs()
-        val target = AtomicFile(file(list))
-        val output = target.startWrite()
-        try {
-            data.writeTo(output)
-            target.finishWrite(output)
-        } catch (error: IOException) {
-            target.failWrite(output)
-            throw error
+        val now = System.currentTimeMillis()
+        if (!anyPartChanged && file(list).exists()) {
+            preferences.edit().putLong("updated." + list.name, now).apply()
+            DownloadOutcome.NOT_MODIFIED
+        } else {
+            folder.mkdirs()
+            val target = AtomicFile(file(list))
+            val output = target.startWrite()
+            try {
+                data.writeTo(output)
+                target.finishWrite(output)
+            } catch (error: IOException) {
+                target.failWrite(output)
+                throw error
+            }
+            preferences.edit().putLong("updated." + list.name, now).apply()
+            DownloadOutcome.CHANGED
         }
-        preferences.edit().putLong("updated." + list.name, System.currentTimeMillis()).apply()
-        true
     } catch (_: IOException) {
-        false   // the copy from last time stays in use
+        DownloadOutcome.FAILED   // the copy from last time stays in use
     }
 
-    /** Reads every saved list into a new engine. Without any list the built-in handful of ad hosts stays. */
-    private fun load() {
+    private fun currentStamp(): String = buildString {
+        for (list in lists) {
+            val saved = file(list)
+            if (saved.exists()) append(list.name).append(':').append(saved.length()).append(':').append(saved.lastModified()).append(';')
+        }
+    }
+
+    /** Reads the pre-parsed binary snapshot if current, else parses the saved text lists and writes a fresh snapshot. */
+    private fun load(rebuildCache: Boolean) {
+        val stamp = currentStamp()
+        if (!rebuildCache && stamp.isNotEmpty() && cacheFile.exists()) {
+            val cached = runCatching {
+                DataInputStream(BufferedInputStream(cacheFile.inputStream())).use { FilterEngine.readFrom(it, stamp) }
+            }.getOrNull()
+            if (cached != null) {
+                engine = cached
+                exempt = "" to 0
+                version++
+                updateStatusFromCurrentEngine()
+                return
+            }
+        }
+
         val builder = FilterEngine.Builder()
         seed.lineSequence().forEach(builder::add)
         var found = 0
@@ -240,12 +343,36 @@ internal class TrackerBlocker(private val context: Context) {
             runCatching { saved.bufferedReader().useLines { it.forEach(builder::add) } }.onSuccess { found++ }
         }
         if (found > 0) {
-            engine = builder.build()
+            val built = builder.build()
+            engine = built
             exempt = "" to 0
             version++
+            val freshStamp = currentStamp()
+            runCatching {
+                folder.mkdirs()
+                val atomic = AtomicFile(cacheFile)
+                val stream = atomic.startWrite()
+                try {
+                    DataOutputStream(BufferedOutputStream(stream)).use {
+                        built.writeTo(it, freshStamp)
+                        it.flush()
+                    }
+                    atomic.finishWrite(stream)
+                } catch (e: IOException) {
+                    atomic.failWrite(stream)
+                }
+            }
         }
-        status = if (found == 0) L("Werbeblocker: nur Grundschutz, Filterlisten fehlen", "Ad blocker: basic protection only, filter lists missing")
-        else L("Werbeblocker aktiv · ", "Ad blocker active · ") + java.text.NumberFormat.getIntegerInstance().format(engine.count) + L(" Regeln", " rules")
+        if (found == 0) {
+            status = L("Werbeblocker: nur Grundschutz, Filterlisten fehlen", "Ad blocker: basic protection only, filter lists missing")
+        } else {
+            updateStatusFromCurrentEngine()
+        }
+    }
+
+    private fun updateStatusFromCurrentEngine() {
+        status = L("Werbeblocker aktiv · ", "Ad blocker active · ") +
+            java.text.NumberFormat.getIntegerInstance().format(engine.count) + L(" Regeln", " rules")
     }
 
     companion object {
@@ -307,7 +434,7 @@ internal class TrackerBlocker(private val context: Context) {
             return when (ending) {
                 "js", "mjs" -> FilterEngine.SCRIPT
                 "css" -> FilterEngine.CSS
-                "json", "xml", "vtt", "srt", "txt" -> FilterEngine.XHR
+                "json", "xml", "vtt", "srt", "ass", "ssa", "txt" -> FilterEngine.XHR
                 in images -> FilterEngine.IMAGE
                 in fonts -> FilterEngine.FONT
                 in media -> FilterEngine.MEDIA
@@ -331,8 +458,8 @@ internal class TrackerBlocker(private val context: Context) {
                 '\n' -> out.append("\\n")
                 '\r' -> out.append("\\r")
                 '<' -> out.append("\\u003c")
-                ' ' -> out.append("\\u2028")
-                ' ' -> out.append("\\u2029")
+                '\u2028' -> out.append("\\u2028")
+                '\u2029' -> out.append("\\u2029")
                 else -> if (char < ' ') out.append(String.format("\\u%04x", char.code)) else out.append(char)
             }
             return out.append('"').toString()

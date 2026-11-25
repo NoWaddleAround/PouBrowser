@@ -2,7 +2,6 @@ package com.nowaddlearound.poubrowser
 
 import android.content.Context
 import android.content.res.ColorStateList
-import android.graphics.BitmapFactory
 import android.graphics.drawable.InsetDrawable
 import android.text.TextUtils
 import android.view.Gravity
@@ -20,10 +19,12 @@ internal class TabOverview(
     private val onSelect: (BrowserSession.Tab) -> Unit,
     private val onClose: (BrowserSession.Tab) -> Unit,
     onNew: () -> Unit,
+    onReopen: () -> Unit,
     onDone: () -> Unit,
 ) : LinearLayout(context) {
     private val items = Cards()
     private val header = context.label("Tabs", 32f, bold = true)
+    private val reopenButton = context.actionLabel(L("Wiederherstellen", "Reopen"), action = onReopen)
     private val grid = GridView(context)
 
     init {
@@ -33,6 +34,9 @@ internal class TabOverview(
             gravity = Gravity.CENTER_VERTICAL
             setPadding(context.dp(20), context.dp(8), context.dp(16), context.dp(12))
             addView(header, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
+            addView(reopenButton, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT).apply {
+                marginEnd = context.dp(8)
+            })
             addView(context.actionLabel(L("Fertig", "Done"), action = onDone))
         }
         addView(top, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
@@ -62,6 +66,7 @@ internal class TabOverview(
     }
 
     fun refresh(showCurrent: Boolean = false) {
+        reopenButton.visibility = if (session.hasClosedTabs) VISIBLE else GONE
         items.notifyDataSetChanged()
         if (showCurrent) grid.setSelection(session.tabs.indexOf(session.current))
     }
@@ -133,7 +138,7 @@ internal class TabOverview(
         }
 
         fun bind(tab: BrowserSession.Tab, active: Boolean) {
-            val photo = tab.preview?.let { BitmapFactory.decodeByteArray(it, 0, it.size) }
+            val photo = tab.thumbnail()
             picture.setImageBitmap(photo)
             fallback.visibility = if (photo == null) VISIBLE else GONE
             title.text = tab.label

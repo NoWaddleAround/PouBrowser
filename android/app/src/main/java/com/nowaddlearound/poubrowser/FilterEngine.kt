@@ -1,6 +1,10 @@
 package com.nowaddlearound.poubrowser
 
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import java.io.DataInputStream
+import java.io.DataOutputStream
+import java.io.IOException
+import java.util.IdentityHashMap
 import java.util.concurrent.ConcurrentHashMap
 import java.util.regex.Pattern
 
@@ -33,7 +37,8 @@ internal class FilterEngine private constructor(
         var allow = false
         var allowImportant = false
         if (type and (DOCUMENT or POPUP) == 0) forEachSuffix(host) { if (it in plainHosts) block = true }
-        requests.candidates(url, host, pageHost) { rule, viaHost ->
+        val lowerUrl = url.lowercase()
+        requests.candidates(lowerUrl, host, pageHost) { rule, viaHost ->
             val exception = rule.flags and EXCEPTION != 0
             val important = rule.flags and IMPORTANT != 0
             val known = if (exception) (if (important) allowImportant else allow) else (if (important) blockImportant else block)
@@ -52,7 +57,8 @@ internal class FilterEngine private constructor(
     /** Exceptions that switch the blocker off for a whole page: a mask of [EXEMPT_ALL], [EXEMPT_COSMETIC], [EXEMPT_GENERIC]. */
     fun exemptions(url: String, host: String): Int {
         var mask = 0
-        pages.candidates(url, host, host) { rule, viaHost ->
+        val lowerUrl = url.lowercase()
+        pages.candidates(lowerUrl, host, host) { rule, viaHost ->
             if (rule.excludes(host) || !rule.matches(url, viaHost)) return@candidates
             if (rule.types and DOCUMENT != 0) mask = mask or EXEMPT_ALL
             if (rule.flags and ELEMHIDE != 0) mask = mask or EXEMPT_COSMETIC
@@ -97,6 +103,47 @@ internal class FilterEngine private constructor(
             }
         }
         return PageRules(css, extended, js, scriptlets)
+    }
+
+    /** Writes a pre-parsed binary snapshot so cold app launches skip regex-parsing raw filter lists. */
+    fun writeTo(out: DataOutputStream, stamp: String = "") {
+        out.writeInt(CACHE_MAGIC)
+        out.writeInt(CACHE_VERSION)
+        writeStr(out, stamp)
+        out.writeInt(count)
+
+        out.writeInt(plainHosts.size)
+        for (host in plainHosts) writeStr(out, host)
+
+        requests.writeTo(out)
+        pages.writeTo(out)
+
+        out.writeInt(genericHide.size)
+        for (selector in genericHide) writeStr(out, selector)
+
+        val cosmeticPool = HashMap<String, Int>()
+        val cosmeticList = ArrayList<String>()
+        for (entries in cosmetic.values) for (entry in entries) {
+            if (entry !in cosmeticPool) {
+                cosmeticPool[entry] = cosmeticList.size
+                cosmeticList.add(entry)
+            }
+        }
+        out.writeInt(cosmeticList.size)
+        for (entry in cosmeticList) writeStr(out, entry)
+        out.writeInt(cosmetic.size)
+        for ((domain, entries) in cosmetic) {
+            writeStr(out, domain)
+            out.writeInt(entries.size)
+            for (entry in entries) out.writeInt(cosmeticPool.getValue(entry))
+        }
+
+        out.writeInt(uncosmetic.size)
+        for ((domain, set) in uncosmetic) {
+            writeStr(out, domain)
+            out.writeInt(set.size)
+            for (selector in set) writeStr(out, selector)
+        }
     }
 
     /** Host and its parent domains, each also with the public suffix as `*` (`google.*`), then "" for rules that apply everywhere. */
@@ -180,9 +227,9 @@ internal class FilterEngine private constructor(
         private val byPage: Map<String, Array<Rule>>,
         private val rest: Array<Rule>,
     ) {
-        inline fun candidates(url: String, host: String, pageHost: String?, action: (Rule, Boolean) -> Unit) {
+        inline fun candidates(lowerUrl: String, host: String, pageHost: String?, action: (Rule, Boolean) -> Unit) {
             forEachSuffix(host) { suffix -> byHost[suffix]?.forEach { action(it, true) } }
-            forEachToken(url) { token -> byToken[token]?.forEach { action(it, false) } }
+            forEachLowerToken(lowerUrl) { token -> byToken[token]?.forEach { action(it, false) } }
             if (pageHost != null) {
                 val ending = siteOf(pageHost).substringAfter('.', "")
                 forEachSuffix(pageHost) { suffix ->
@@ -192,6 +239,82 @@ internal class FilterEngine private constructor(
                 }
             }
             for (rule in rest) action(rule, false)
+        }
+
+        fun writeTo(out: DataOutputStream) {
+            val ids = IdentityHashMap<Rule, Int>()
+            val unique = ArrayList<Rule>()
+            fun register(rules: Array<Rule>) {
+                for (rule in rules) if (!ids.containsKey(rule)) {
+                    ids[rule] = unique.size
+                    unique.add(rule)
+                }
+            }
+            byHost.values.forEach(::register)
+            byToken.values.forEach(::register)
+            byPage.values.forEach(::register)
+            register(rest)
+
+            out.writeInt(unique.size)
+            for (rule in unique) {
+                writeStr(out, rule.pattern)
+                out.writeInt(rule.flags)
+                out.writeInt(rule.types)
+                val ex = rule.exclude
+                out.writeInt(ex?.size ?: 0)
+                if (ex != null) for (domain in ex) writeStr(out, domain)
+            }
+
+            fun writeMap(map: Map<String, Array<Rule>>) {
+                out.writeInt(map.size)
+                for ((key, list) in map) {
+                    writeStr(out, key)
+                    out.writeInt(list.size)
+                    for (rule in list) out.writeInt(ids.getValue(rule))
+                }
+            }
+            writeMap(byHost)
+            writeMap(byToken)
+            writeMap(byPage)
+            out.writeInt(rest.size)
+            for (rule in rest) out.writeInt(ids.getValue(rule))
+        }
+
+        companion object {
+            fun readFrom(input: DataInputStream, reader: StrReader): Index {
+                val uniqueCount = input.readInt()
+                if (uniqueCount < 0 || uniqueCount > MAX_CACHE_ITEMS) throw IOException("Corrupt rule count")
+                val unique = Array(uniqueCount) {
+                    val pattern = reader.read(input)
+                    val flags = input.readInt()
+                    val types = input.readInt()
+                    val exSize = input.readInt()
+                    if (exSize < 0 || exSize > MAX_CACHE_ITEMS) throw IOException("Corrupt exclude count")
+                    val exclude = if (exSize == 0) null else Array(exSize) { reader.read(input) }
+                    Rule(pattern, flags, types, exclude)
+                }
+
+                fun readMap(): Map<String, Array<Rule>> {
+                    val size = input.readInt()
+                    if (size < 0 || size > MAX_CACHE_ITEMS) throw IOException("Corrupt map size")
+                    val map = HashMap<String, Array<Rule>>(size * 4 / 3 + 1)
+                    repeat(size) {
+                        val key = reader.read(input)
+                        val count = input.readInt()
+                        if (count < 0 || count > uniqueCount) throw IOException("Corrupt bucket size")
+                        map[key] = Array(count) { unique[input.readInt()] }
+                    }
+                    return map
+                }
+
+                val byHost = readMap()
+                val byToken = readMap()
+                val byPage = readMap()
+                val restSize = input.readInt()
+                if (restSize < 0 || restSize > uniqueCount) throw IOException("Corrupt rest size")
+                val rest = Array(restSize) { unique[input.readInt()] }
+                return Index(byHost, byToken, byPage, rest)
+            }
         }
     }
 
@@ -408,6 +531,18 @@ internal class FilterEngine private constructor(
             HashMap<String, Array<Rule>>(size * 2).also { for ((key, value) in this) it[key] = value.toTypedArray() }
     }
 
+    internal class StrReader {
+        private var buffer = ByteArray(1024)
+        fun read(input: DataInputStream): String {
+            val len = input.readInt()
+            if (len == 0) return ""
+            if (len < 0 || len > MAX_STRING_BYTES) throw IOException("Corrupt string length")
+            if (len > buffer.size) buffer = ByteArray(maxOf(len, buffer.size * 2))
+            input.readFully(buffer, 0, len)
+            return String(buffer, 0, len, Charsets.UTF_8)
+        }
+    }
+
     companion object {
         const val SCRIPT = 1
         const val IMAGE = 2
@@ -429,6 +564,11 @@ internal class FilterEngine private constructor(
         const val EXEMPT_ALL = 1
         const val EXEMPT_COSMETIC = 2
         const val EXEMPT_GENERIC = 4
+
+        private const val CACHE_MAGIC = 0x504F5546
+        private const val CACHE_VERSION = 1
+        private const val MAX_CACHE_ITEMS = 2_000_000
+        private const val MAX_STRING_BYTES = 4 * 1024 * 1024
 
         private const val EXCEPTION = 1
         private const val IMPORTANT = 2
@@ -466,12 +606,79 @@ internal class FilterEngine private constructor(
         fun siteOf(host: String): String {
             sites[host]?.let { return it }
             val site = "http://$host/".toHttpUrlOrNull()?.topPrivateDomain() ?: host
-            if (sites.size > 4000) sites.clear()
+            if (sites.size >= 4096) {
+                val iterator = sites.keys.iterator()
+                var dropped = 0
+                while (dropped < 512 && iterator.hasNext()) {
+                    iterator.next()
+                    iterator.remove()
+                    dropped++
+                }
+            }
             sites[host] = site
             return site
         }
 
         fun parse(lines: Sequence<String>): FilterEngine = Builder().apply { lines.forEach(::add) }.build()
+
+        /** Reads a binary snapshot written by [writeTo], returning null if version or [expectedStamp] mismatches. */
+        fun readFrom(input: DataInputStream, expectedStamp: String? = null): FilterEngine? = try {
+            if (input.readInt() != CACHE_MAGIC || input.readInt() != CACHE_VERSION) null
+            else {
+                val reader = StrReader()
+                val stamp = reader.read(input)
+                if (expectedStamp != null && stamp != expectedStamp) null
+                else {
+                    val count = input.readInt()
+                    val plainSize = input.readInt()
+                    if (plainSize < 0 || plainSize > MAX_CACHE_ITEMS) throw IOException("Corrupt plain size")
+                    val plain = HashSet<String>(plainSize * 4 / 3 + 1)
+                    repeat(plainSize) { plain.add(reader.read(input)) }
+
+                    val requests = Index.readFrom(input, reader)
+                    val pages = Index.readFrom(input, reader)
+
+                    val genericSize = input.readInt()
+                    if (genericSize < 0 || genericSize > MAX_CACHE_ITEMS) throw IOException("Corrupt generic size")
+                    val generic = Array(genericSize) { reader.read(input) }
+
+                    val poolSize = input.readInt()
+                    if (poolSize < 0 || poolSize > MAX_CACHE_ITEMS) throw IOException("Corrupt pool size")
+                    val cosmeticPool = Array(poolSize) { reader.read(input) }
+                    val cosmeticSize = input.readInt()
+                    if (cosmeticSize < 0 || cosmeticSize > MAX_CACHE_ITEMS) throw IOException("Corrupt cosmetic size")
+                    val cosmetic = HashMap<String, Array<String>>(cosmeticSize * 4 / 3 + 1)
+                    repeat(cosmeticSize) {
+                        val domain = reader.read(input)
+                        val entryCount = input.readInt()
+                        if (entryCount < 0 || entryCount > poolSize) throw IOException("Corrupt cosmetic entry count")
+                        cosmetic[domain] = Array(entryCount) { cosmeticPool[input.readInt()] }
+                    }
+
+                    val uncosmeticSize = input.readInt()
+                    if (uncosmeticSize < 0 || uncosmeticSize > MAX_CACHE_ITEMS) throw IOException("Corrupt uncosmetic size")
+                    val uncosmetic = HashMap<String, Set<String>>(uncosmeticSize * 4 / 3 + 1)
+                    repeat(uncosmeticSize) {
+                        val domain = reader.read(input)
+                        val setSize = input.readInt()
+                        if (setSize < 0 || setSize > MAX_CACHE_ITEMS) throw IOException("Corrupt uncosmetic set size")
+                        val set = HashSet<String>(setSize * 4 / 3 + 1)
+                        repeat(setSize) { set.add(reader.read(input)) }
+                        uncosmetic[domain] = set
+                    }
+
+                    FilterEngine(plain, requests, pages, generic, cosmetic, uncosmetic, count)
+                }
+            }
+        } catch (_: Exception) {
+            null
+        }
+
+        private fun writeStr(out: DataOutputStream, value: String) {
+            val bytes = value.toByteArray(Charsets.UTF_8)
+            out.writeInt(bytes.size)
+            if (bytes.isNotEmpty()) out.write(bytes)
+        }
 
         private fun validHost(host: String) =
             host.isNotEmpty() && host.length <= 253 && !host.startsWith(".") && !host.endsWith(".") && ".." !in host
@@ -488,14 +695,17 @@ internal class FilterEngine private constructor(
 
         internal fun Char.isToken() = this in 'a'..'z' || this in '0'..'9'
 
-        internal inline fun forEachToken(url: String, action: (String) -> Unit) {
+        internal inline fun forEachLowerToken(lowerUrl: String, action: (String) -> Unit) {
             var start = -1
-            for (index in 0..url.length) {
-                val inside = index < url.length && url[index].lowercaseChar().isToken()
+            for (index in 0..lowerUrl.length) {
+                val inside = index < lowerUrl.length && lowerUrl[index].isToken()
                 if (inside) {
                     if (start < 0) start = index
                 } else if (start >= 0) {
-                    if (index - start >= 2) action(url.substring(start, index).lowercase())
+                    if (index - start >= 2) {
+                        val token = lowerUrl.substring(start, index)
+                        if (token !in commonTokens) action(token)
+                    }
                     start = -1
                 }
             }
@@ -539,7 +749,7 @@ internal class FilterEngine private constructor(
                         index += 2
                         continue
                     }
-                    if (char == ',' ) {
+                    if (char == ',') {
                         var value = part.toString().trim()
                         if (value.length >= 2 && value[0] == value[value.length - 1] && value[0] in "'\"`") value = value.substring(1, value.length - 1)
                         parts.add(value)

@@ -15,6 +15,19 @@ class BrowserPolicyTest {
         assertNull(BrowserPolicy.destination("https://bank.example@tracker.com"))
     }
 
+    @Test fun cleanUrlStripsTrackingParametersAndPreservesAuthCallbacks() {
+        assertEquals(
+            "https://shop.example/item?id=42",
+            BrowserPolicy.destination("https://shop.example/item?id=42&fbclid=xyz&utm_source=feed&gclid=123")?.toString(),
+        )
+        assertEquals(
+            "https://shop.example/item",
+            BrowserPolicy.destination("shop.example/item?utm_medium=social&igshid=abc")?.toString(),
+        )
+        val oauth = BrowserPolicy.webUrl("https://id.example/oauth/callback?code=999&utm_source=keep")!!
+        assertEquals(oauth, BrowserPolicy.cleanUrl(oauth))
+    }
+
     @Test fun aNavigationCountsAsTappedOnlyWhenItGoesToTheTouchedLinkOrForm() {
         val link = BrowserPolicy.webUrl("https://shop.example/item?id=1#top")!!
         assertTrue(BrowserPolicy.sameTarget(link, BrowserPolicy.webUrl("https://shop.example/item?id=1")!!, form = false))

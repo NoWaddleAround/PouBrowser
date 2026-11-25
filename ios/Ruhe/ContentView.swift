@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import WebKit
 
 struct ContentView: View {
@@ -17,7 +18,7 @@ struct ContentView: View {
         WebViewHost(webView: browser.webView)
             .id(ObjectIdentifier(browser.webView))   // each tab has its own web view and may replace it
             .overlay {
-                if browser.url == nil {
+                if browser.address == nil {
                     ContentUnavailableView(
                         "PouBrowser", systemImage: "shield.lefthalf.filled",
                         description: Text(L(
@@ -26,6 +27,17 @@ struct ContentView: View {
                         ) + "\n\n" + session.blocker.status)
                     )
                     .background(Color(.systemBackground))
+                } else if !browser.hasCommittedPage, let preview = browser.previewImage {
+                    // Prevents a white flash while a sleeping tab wakes and restores its page.
+                    GeometryReader { geo in
+                        Image(uiImage: preview)
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: geo.size.width, height: geo.size.height, alignment: .top)
+                            .clipped()
+                    }
+                    .background(Color(.systemBackground))
+                    .allowsHitTesting(false)
                 }
             }
             // Floats over the page: a notice per blocked popup must not make the page jump.
@@ -58,12 +70,22 @@ struct ContentView: View {
             }
             .animation(.easeOut(duration: 0.25), value: hidesBars)
             .onChange(of: browser.address, initial: true) { showAddress() }
-            .onChange(of: editing) { showAddress() }
+            .onChange(of: editing) {
+                showAddress()
+                if editing && !address.isEmpty {
+                    Task { @MainActor in
+                        UIApplication.shared.sendAction(#selector(UIResponder.selectAll(_:)), to: nil, from: nil, for: nil)
+                    }
+                }
+            }
             .fullScreenCover(isPresented: $showsTabs, onDismiss: focusNewTab) {
                 TabOverview(session: session) {
                     session.newTab()
                     focusesNewTab = true
                 }
+            }
+            .onOpenURL { url in
+                session.openExternal(url)
             }
             // The log shows a jump into another app; the reading position is saved for the way back.
             .onChange(of: scenePhase) { old, new in
@@ -77,7 +99,7 @@ struct ContentView: View {
     }
 
     /// While reading down a page the bars are out of the way. Typing an address and the start page keep them.
-    private var hidesBars: Bool { browser.barsHidden && !editing && browser.url != nil }
+    private var hidesBars: Bool { browser.barsHidden && !editing && browser.address != nil }
 
     /// Site name while reading, full address while editing.
     private func showAddress() {
@@ -97,12 +119,27 @@ struct ContentView: View {
                 icon(L("Bild-in-Bild", "Picture in Picture"), "pip.enter") { browser.toggleFloat() }
             }
             Menu {
-                if browser.url != nil {
-                    Toggle(L("JavaScript auf dieser Seite", "JavaScript on this site"), isOn: Bindable(browser).scriptsAllowed)
-                    Toggle(L("Werbeblocker auf dieser Seite", "Ad blocker on this site"), isOn: Bindable(browser).filteringAllowed)
+                if let pageURL = browser.address {
+                    Section {
+                        ShareLink(item: pageURL) {
+                            Label(L("Seite teilen", "Share page"), systemImage: "square.and.arrow.up")
+                        }
+                        if browser.hasCommittedPage {
+                            Button(L("Auf der Seite suchen", "Find on page"), systemImage: "magnifyingglass") {
+                                browser.findInPage()
+                            }
+                        }
+                    }
+                    Section {
+                        Toggle(L("JavaScript auf dieser Seite", "JavaScript on this site"), isOn: Bindable(browser).scriptsAllowed)
+                        Toggle(L("Werbeblocker auf dieser Seite", "Ad blocker on this site"), isOn: Bindable(browser).filteringAllowed)
+                        Toggle(L("Desktop-Webseite", "Desktop site"), isOn: Bindable(browser).desktopMode)
+                    }
                 }
-                Toggle(L("Seiten abdunkeln", "Darken pages"), isOn: Bindable(session).darkPages)
-                Toggle(L("Bild-in-Bild", "Picture in Picture"), isOn: Bindable(session).floatsVideo)
+                Section {
+                    Toggle(L("Seiten abdunkeln", "Darken pages"), isOn: Bindable(session).darkPages)
+                    Toggle(L("Bild-in-Bild", "Picture in Picture"), isOn: Bindable(session).floatsVideo)
+                }
                 Section(session.blocker.status) {
                     Button(L("Filterlisten aktualisieren", "Update filter lists"), systemImage: "arrow.down.circle") {
                         Task { await session.blocker.update() }

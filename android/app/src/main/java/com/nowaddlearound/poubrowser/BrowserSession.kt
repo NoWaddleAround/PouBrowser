@@ -1,6 +1,8 @@
 package com.nowaddlearound.poubrowser
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.os.Bundle
 import android.os.SystemClock
 import android.view.View
@@ -38,9 +40,12 @@ internal class BrowserSession(
         fun notice(text: String, destination: HttpUrl? = null)
         fun showFullscreen(view: View, callback: WebChromeClient.CustomViewCallback)
         fun hideFullscreen()
+        fun showLinkActions(url: HttpUrl)
     }
 
     enum class WipeResult { COMPLETE, PARTIAL, SAVE_FAILED }
+
+    private class ClosedTab(val url: HttpUrl, val title: String, val scroll: Int)
 
     class Tab internal constructor(
         address: HttpUrl? = null,
@@ -51,10 +56,23 @@ internal class BrowserSession(
         val host get() = address?.host?.removePrefix("www.")
         val label get() = title.ifBlank { host ?: L("Neuer Tab", "New tab") }
 
+        private var cachedBitmap: Bitmap? = null
         var preview: ByteArray? = null
+            set(value) {
+                field = value
+                cachedBitmap = null
+            }
+
+        internal fun thumbnail(): Bitmap? {
+            cachedBitmap?.let { return it }
+            val bytes = preview ?: return null
+            return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.also { cachedBitmap = it }
+        }
+
         var progress = 100
         var webView: WebView? = null
             internal set
+        internal var defaultUserAgent: String = ""
         internal var history: Bundle? = null
         @Volatile internal var committed: HttpUrl? = null
         internal var pendingScroll: Int? = null
@@ -68,9 +86,12 @@ internal class BrowserSession(
 
         /** The page the tab is loading or showing: what its requests are judged against. */
         @Volatile internal var requested: HttpUrl? = null
-        /** Scripts installed for the page in front, and what they were built for. */
-        internal val pageScripts = ArrayList<ScriptHandler>()
-        internal var scriptsFor: String? = null
+        /** Wildcard scripts (`*`: Dark Reader and global generic CSS) kept across cross-site navigations. */
+        internal val globalScripts = ArrayList<ScriptHandler>()
+        internal var globalScriptsFor: String? = null
+        /** Host-scoped scripts (`https://example.com`) swapped when moving between origins. */
+        internal val originScripts = ArrayList<ScriptHandler>()
+        internal var originScriptsFor: String? = null
         internal val frames: MutableSet<String> = ConcurrentHashMap.newKeySet()
 
         internal fun freshTap() = tapped?.takeIf { SystemClock.uptimeMillis() - tappedAt < 3000 }
@@ -79,6 +100,7 @@ internal class BrowserSession(
     private val preferences = context.getSharedPreferences("browser", Context.MODE_PRIVATE)
     private val roster = restoreTabs()
     private val recent = mutableListOf<Tab>()
+    private val closed = ArrayDeque<ClosedTab>()
     private val diagnostics = ArrayDeque<String>()
     private val browserScript = readAsset("browser.js")
     private val captionScript = readAsset("captions.js")
@@ -86,12 +108,14 @@ internal class BrowserSession(
     // With both, the page script reports tapped links. Older WebViews fall back to "any touch counts".
     private val tapReports = documentStart && WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)
     private val scriptlessSites = preferences.getStringSet("scriptless", emptySet()).orEmpty().toMutableSet()
+    private val desktopSites = preferences.getStringSet("desktop", emptySet()).orEmpty().toMutableSet()
     // Sites where the user switched the ad blocker off because the site refuses to work with one.
     // Popups and forced redirects stay blocked there.
     private val unfilteredSites: MutableSet<String> =
         ConcurrentHashMap.newKeySet<String>().apply { addAll(preferences.getStringSet("unfiltered", emptySet()).orEmpty()) }
 
     val tabs: List<Tab> get() = roster
+    val hasClosedTabs: Boolean get() = closed.isNotEmpty()
     var current = roster[preferences.getInt("current", 0).coerceIn(roster.indices)]
         private set
     val activeView get() = current.webView ?: makeWebView(current)
@@ -131,9 +155,34 @@ internal class BrowserSession(
 
     fun newTab() = select(Tab().also(roster::add))
 
+    fun openInNewTab(rawUrl: HttpUrl, inBackground: Boolean = false) {
+        val cleaned = BrowserPolicy.cleanUrl(rawUrl)
+        val tab = Tab(address = cleaned)
+        val insertAt = (roster.indexOf(current) + 1).coerceIn(0, roster.size)
+        roster.add(insertAt, tab)
+        if (inBackground) {
+            save()
+            events.pageChanged()
+            events.notice(L("Im Hintergrund geöffnet · ", "Opened in background · ") + cleaned.host)
+        } else {
+            select(tab)
+        }
+    }
+
+    fun openExternal(raw: String?) {
+        val url = raw?.let(BrowserPolicy::webUrl)?.let(BrowserPolicy::cleanUrl) ?: return
+        if (current.address == null) open(url)
+        else openInNewTab(url, inBackground = false)
+    }
+
     fun close(tab: Tab) {
         val index = roster.indexOf(tab)
         if (index < 0) return
+        remember(tab)
+        tab.address?.let { url ->
+            if (closed.size >= 10) closed.removeFirst()
+            closed.addLast(ClosedTab(url, tab.title, tab.scroll))
+        }
         roster.removeAt(index)
         recent.remove(tab)
         dispose(tab)
@@ -145,6 +194,13 @@ internal class BrowserSession(
         }
     }
 
+    fun reopenClosedTab() {
+        val item = closed.removeLastOrNull() ?: return
+        val tab = Tab(item.url, item.title, item.scroll)
+        roster.add(tab)
+        select(tab)
+    }
+
     fun openInput(value: String) {
         val address = BrowserPolicy.destination(value)
         if (address != null) open(address)
@@ -153,7 +209,7 @@ internal class BrowserSession(
 
     fun open(url: HttpUrl) {
         current.crashed = false
-        load(current, activeView, url)
+        load(current, activeView, BrowserPolicy.cleanUrl(url))
     }
 
     fun reload() {
@@ -187,6 +243,8 @@ internal class BrowserSession(
 
     fun filteringAllowed(url: HttpUrl?): Boolean = url == null || BrowserPolicy.site(url) !in unfilteredSites
 
+    fun desktopAllowed(url: HttpUrl?): Boolean = url != null && BrowserPolicy.site(url) in desktopSites
+
     fun toggleFiltering() {
         val url = current.address ?: return
         val site = BrowserPolicy.site(url)
@@ -206,6 +264,14 @@ internal class BrowserSession(
             tab.history = null
             dispose(tab)
         }
+        reload()
+    }
+
+    fun toggleDesktop() {
+        val url = current.address ?: return
+        val site = BrowserPolicy.site(url)
+        if (!desktopSites.add(site)) desktopSites.remove(site)
+        preferences.edit().putStringSet("desktop", desktopSites.toSet()).apply()
         reload()
     }
 
@@ -233,6 +299,7 @@ internal class BrowserSession(
         activeView.clearCache(true)
         roster.forEach(::dispose)
         diagnostics.clear()
+        closed.clear()
         recent.clear()
         roster.clear()
         current = Tab()
@@ -279,6 +346,7 @@ internal class BrowserSession(
     private fun makeWebView(tab: Tab): WebView {
         val view = WebView(context)
         tab.webView = view
+        tab.defaultUserAgent = view.settings.userAgentString
         view.settings.apply {
             javaScriptEnabled = scriptsAllowed(tab.address)
             domStorageEnabled = true
@@ -293,6 +361,7 @@ internal class BrowserSession(
             displayZoomControls = false
             mediaPlaybackRequiresUserGesture = true
         }
+        configureDesktop(tab, view, tab.address)
         CookieManager.getInstance().setAcceptThirdPartyCookies(view, false)
         if (tapReports) {
             WebViewCompat.addWebMessageListener(view, "pouTap", setOf("*")) { _, message, _, _, _ ->
@@ -311,9 +380,19 @@ internal class BrowserSession(
         }
         if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
             WebViewCompat.addDocumentStartJavaScript(view, browserScript, setOf("*"))
-            WebViewCompat.addDocumentStartJavaScript(
-                view, captionScript, setOf("https://krussdomi.com", "https://*.krussdomi.com"),
-            )
+            WebViewCompat.addDocumentStartJavaScript(view, captionScript, setOf("*"))
+        }
+        view.setOnLongClickListener {
+            val hit = view.hitTestResult
+            val link = when (hit.type) {
+                WebView.HitTestResult.SRC_ANCHOR_TYPE,
+                WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE -> hit.extra?.let(BrowserPolicy::webUrl)
+                else -> null
+            }
+            if (link != null) {
+                events.showLinkActions(link)
+                true
+            } else false
         }
         view.webViewClient = NavigationClient(tab)
         view.webChromeClient = ChromeClient(tab)
@@ -349,25 +428,64 @@ internal class BrowserSession(
         view.settings.javaScriptEnabled = scriptsAllowed(url)
     }
 
+    private fun configureDesktop(tab: Tab, view: WebView, url: HttpUrl?) {
+        val desktop = desktopAllowed(url)
+        view.settings.apply {
+            if (tab.defaultUserAgent.isNotEmpty()) {
+                userAgentString = if (desktop) DESKTOP_USER_AGENT else tab.defaultUserAgent
+            }
+            useWideViewPort = desktop
+            loadWithOverviewMode = desktop
+        }
+    }
+
     /**
-     * Gets the view ready for a page before it loads: the JavaScript switch, and the scripts that must
-     * run ahead of the page's own (dark colours, hidden ad areas, scriptlets). They are swapped only
-     * when the site, a switch or the rules changed.
+     * Gets the view ready for a page before it loads: the JavaScript and Desktop switches, plus the scripts
+     * that must run ahead of the page's own. Wildcard scripts (`*`: Dark Reader, generic CSS) stay registered
+     * across cross-site clicks, while host-specific scripts swap per origin.
      */
     private fun prepare(tab: Tab, view: WebView, url: HttpUrl) {
         configureScripts(view, url)
+        configureDesktop(tab, view, url)
         tab.requested = url
         if (!documentStart) return
         val filtered = filteringAllowed(url)
-        val wanted = TrackerBlocker.origin(url) + "|" + filtered + "|" + darkPages + "|" + blocker.version
-        if (wanted == tab.scriptsFor) return
-        tab.scriptsFor = wanted
-        tab.pageScripts.forEach(ScriptHandler::remove)
-        tab.pageScripts.clear()
-        tab.frames.clear()
-        if (darkPages) tab.pageScripts.add(WebViewCompat.addDocumentStartJavaScript(view, blocker.darkScript, setOf("*")))
-        if (filtered) for ((script, origins) in blocker.pageScripts(url)) {
-            runCatching { WebViewCompat.addDocumentStartJavaScript(view, script, origins) }.getOrNull()?.let(tab.pageScripts::add)
+        val plan = if (filtered) blocker.planScripts(url) else null
+        val useWildcard = plan?.useWildcardGeneric == true
+
+        val wantedGlobal = "$useWildcard|$darkPages|${blocker.version}"
+        if (wantedGlobal != tab.globalScriptsFor) {
+            tab.globalScriptsFor = wantedGlobal
+            tab.globalScripts.forEach(ScriptHandler::remove)
+            tab.globalScripts.clear()
+            if (darkPages) {
+                runCatching { WebViewCompat.addDocumentStartJavaScript(view, blocker.darkScript, setOf("*")) }
+                    .getOrNull()?.let(tab.globalScripts::add)
+            }
+            if (useWildcard) {
+                runCatching { WebViewCompat.addDocumentStartJavaScript(view, blocker.genericScript(), setOf("*")) }
+                    .getOrNull()?.let(tab.globalScripts::add)
+            }
+        }
+
+        val origin = TrackerBlocker.origin(url)
+        val wantedOrigin = "$origin|$filtered|${blocker.version}"
+        if (wantedOrigin != tab.originScriptsFor) {
+            tab.originScriptsFor = wantedOrigin
+            tab.originScripts.forEach(ScriptHandler::remove)
+            tab.originScripts.clear()
+            tab.frames.clear()
+            if (plan != null) {
+                val origins = setOf(origin)
+                plan.customGenericOriginScript?.let { script ->
+                    runCatching { WebViewCompat.addDocumentStartJavaScript(view, script, origins) }
+                        .getOrNull()?.let(tab.originScripts::add)
+                }
+                plan.originPageScript?.let { script ->
+                    runCatching { WebViewCompat.addDocumentStartJavaScript(view, script, origins) }
+                        .getOrNull()?.let(tab.originScripts::add)
+                }
+            }
         }
     }
 
@@ -407,8 +525,10 @@ internal class BrowserSession(
     private fun dispose(tab: Tab) {
         val view = tab.webView ?: return
         tab.webView = null
-        tab.pageScripts.clear()
-        tab.scriptsFor = null
+        tab.globalScripts.clear()
+        tab.globalScriptsFor = null
+        tab.originScripts.clear()
+        tab.originScriptsFor = null
         (view.parent as? ViewGroup)?.removeView(view)
         view.destroy()
     }
@@ -434,6 +554,13 @@ internal class BrowserSession(
                 return true
             }
             if (!request.isForMainFrame) return false
+            if (url.encodedPath.lowercase().endsWith(".ics")) {
+                if (tab === current) {
+                    record("Kalender-Datei blockiert · " + url.host)
+                    events.notice(L("Kalender-Datei blockiert · ", "Calendar file blocked · ") + url.host)
+                }
+                return true
+            }
             val from = tab.committed ?: tab.address
             // A touch alone is no proof: ad scripts send the tab away from inside the tap handler. Where the
             // page script can report it, the navigation must go to the link or form that was touched.
@@ -453,6 +580,13 @@ internal class BrowserSession(
                     events.notice(L("Von Filterliste blockiert · ", "Blocked by a filter list · ") + url.host, url)
                 }
                 return true
+            }
+            if (hasGesture && !request.isRedirect && request.method.equals("GET", ignoreCase = true)) {
+                val cleaned = BrowserPolicy.cleanUrl(url)
+                if (cleaned != url) {
+                    load(tab, view, cleaned)
+                    return true
+                }
             }
             if (!request.isRedirect) tab.trustedChain = hasGesture
             prepare(tab, view, url)
@@ -487,7 +621,7 @@ internal class BrowserSession(
                     if (tab.webView !== view) return@post
                     val script = blocker.frameScript(frame) ?: return@post
                     runCatching { WebViewCompat.addDocumentStartJavaScript(view, script, setOf(TrackerBlocker.origin(frame))) }
-                        .getOrNull()?.let(tab.pageScripts::add)
+                        .getOrNull()?.let(tab.originScripts::add)
                 }
             }
             return blocker.intercept(request, page, filtered)
@@ -526,8 +660,7 @@ internal class BrowserSession(
             tab.progress = 100
             if (!documentStart && scriptsAllowed(target)) {
                 view.evaluateJavascript(browserScript, null)
-                if (target.isHttps && BrowserPolicy.site(target) == "krussdomi.com")
-                    view.evaluateJavascript(captionScript, null)
+                view.evaluateJavascript(captionScript, null)
             }
             val scroll = tab.pendingScroll
             if (scroll != null) view.postVisualStateCallback(0, object : WebView.VisualStateCallback() {
@@ -588,5 +721,10 @@ internal class BrowserSession(
         override fun onHideCustomView() {
             if (tab === current) events.hideFullscreen()
         }
+    }
+
+    companion object {
+        private const val DESKTOP_USER_AGENT =
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
     }
 }

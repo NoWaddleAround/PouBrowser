@@ -2,6 +2,51 @@
     let current, candidate, prepared, visible;
     const seen = new Set();
 
+    function toWebVTT(raw, url) {
+        const path = (() => { try { return new URL(url).pathname.toLowerCase(); } catch (_) { return ''; } })();
+        const text = raw.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
+        if (/^WEBVTT(\s|$)/.test(text)) return text;
+        if (path.endsWith('.ass') || path.endsWith('.ssa') || /^\[Script Info\]/im.test(text)) {
+            const lines = text.split('\n');
+            let format = null;
+            const cues = [];
+            const stamp = value => {
+                const m = value.trim().match(/^(\d+):(\d{2}):(\d{2})\.(\d{2,3})$/);
+                if (!m) return null;
+                const ms = m[4].length === 2 ? m[4] + '0' : m[4];
+                return m[1].padStart(2, '0') + ':' + m[2] + ':' + m[3] + '.' + ms;
+            };
+            for (const line of lines) {
+                if (/^Format:/i.test(line)) {
+                    format = line.slice(7).split(',').map(part => part.trim().toLowerCase());
+                    continue;
+                }
+                if (!/^Dialogue:/i.test(line) || !format) continue;
+                const body = line.slice(9).trimStart();
+                const parts = [];
+                let rest = body;
+                for (let i = 0; i < format.length - 1; i++) {
+                    const comma = rest.indexOf(',');
+                    if (comma < 0) break;
+                    parts.push(rest.slice(0, comma));
+                    rest = rest.slice(comma + 1);
+                }
+                parts.push(rest);
+                const start = stamp(parts[format.indexOf('start')] || '');
+                const end = stamp(parts[format.indexOf('end')] || '');
+                const rawText = parts[format.indexOf('text')] || '';
+                const cleaned = rawText.replace(/\{[^}]*\}/g, '').replace(/\\[Nn]/g, '\n').replace(/\\h/g, ' ').trim();
+                if (start && end && cleaned) cues.push(start + ' --> ' + end + '\n' + cleaned);
+            }
+            return cues.length ? 'WEBVTT\n\n' + cues.join('\n\n') + '\n' : null;
+        }
+        if (path.endsWith('.srt') || /\d{2}:\d{2}:\d{2},\d{3}\s*-->/.test(text)) {
+            const converted = text.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2');
+            return 'WEBVTT\n\n' + converted;
+        }
+        return null;
+    }
+
     function restore() {
         if (!visible) return;
         visible.track.mode = visible.mode;
@@ -45,12 +90,12 @@
         try {
             const response = await fetch(loading.url, { signal: loading.abort.signal });
             if (!response.ok) return;
-            const text = await response.text();
-            if (prepared !== loading) return;
+            const vtt = toWebVTT(await response.text(), loading.url);
+            if (!vtt || prepared !== loading) return;
             const element = document.createElement('track');
             element.kind = 'subtitles';
             element.label = 'Untertitel';
-            element.src = URL.createObjectURL(new Blob([text], { type: 'text/vtt' }));
+            element.src = URL.createObjectURL(new Blob([vtt], { type: 'text/vtt' }));
             loading.element = element;
             loading.video.append(element);
             element.track.mode = 'hidden';
@@ -63,7 +108,7 @@
             for (const entry of list.getEntries()) {
                 if (seen.has(entry.name) || !/^https?:\/\//i.test(entry.name)) continue;
                 const path = new URL(entry.name).pathname;
-                if (!/\.vtt$/i.test(path) || /preview|thumb|storyboard|sprite/i.test(path)) continue;
+                if (!/\.(vtt|srt|ass|ssa)$/i.test(path) || /preview|thumb|storyboard|sprite/i.test(path)) continue;
                 seen.add(entry.name);
                 candidate = entry.name;
             }
