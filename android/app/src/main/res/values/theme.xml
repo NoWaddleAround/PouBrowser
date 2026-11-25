@@ -1,0 +1,18 @@
+<resources>
+    <color name="surface">#F4F6F3</color>
+    <color name="panel">#FFFFFF</color>
+    <color name="field">#E8EEEA</color>
+    <color name="ink">#152620</color>
+    <color name="muted">#4D6058</color>
+    <color name="line">#CCD8D1</color>
+    <color name="accent">#006B5D</color>
+    <color name="on_accent">#FFFFFF</color>
+    <color name="danger">#A32C25</color>
+
+    <style name="Theme.PouBrowser" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/surface</item>
+        <item name="android:colorAccent">@color/accent</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+</resources>

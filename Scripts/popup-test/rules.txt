@@ -1,0 +1,6 @@
+! Rules for the test page: start the app with `-testFilterList http://localhost:8765/rules.txt`.
+! Expected on index.html: the heading is green, "Skript-Regeln" says "aktiv", the line "nur ohne Filter" is gone.
+localhost#%#//scriptlet('set-constant', 'ruheScriptlet', 'true')
+localhost#$#h3 { color: green !important; }
+localhost#?#p:contains(nur ohne Filter)
+localhost##+js(set-constant, ruheUbo, true)

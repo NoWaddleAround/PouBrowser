@@ -1,0 +1,25 @@
+<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Popup-Test</title>
+<style>body{font:20px -apple-system;margin:16px}button,a{display:block;margin:10px 0;padding:14px;font-size:18px;border:1px solid #888;border-radius:10px;text-align:left;background:#eee;color:#000;text-decoration:none}</style>
+<h3>Popup-Test</h3>
+<button onclick="window.open('http://127.0.0.1:8765/ad.html')">1 window.open</button>
+<button onclick="location.href='http://127.0.0.1:8765/ad.html'">2 Skript-Redirect</button>
+<button onclick="location.href='itms-apps://apps.apple.com/app/id389801252'">3 App-Schema</button>
+<a href="http://127.0.0.1:8765/ad.html" target="_blank">4 Link neues Fenster, fremd</a>
+<a href="/page2.html" target="_blank">5 Link neues Fenster, gleiche Seite</a>
+<a href="https://maps.apple.com/?q=Berlin">6 Universal Link Maps</a>
+<a href="/hop">7 Link + Server-Redirect fremd</a>
+<button onclick="location.href='/hop'">8 Skript-Hop + Server-Redirect</button>
+<a id=l9 href="/page2.html" onclick="setTimeout(()=>location.href='http://127.0.0.1:8765/ad.html',30)">9 Link + Hijack</a>
+<a href="/spam">10 Kalender-Datei</a>
+<button onclick="var a=document.createElement('a');a.href='/page2.html';a.target='_blank';document.body.appendChild(a);a.click()">11 Skript klickt Link, neues Fenster</button>
+<div style="position:relative;margin:10px 0"><button onclick="this.textContent='12 erreicht'" style="margin:0;width:100%">12 Knopf unter Werbe-Ebene</button><div onclick="window.open('http://127.0.0.1:8765/ad.html')" style="position:absolute;inset:0"></div></div>
+<a href="http://127.0.0.1:8765/ad.html">13 Link fremd, direkt</a>
+<form action="http://127.0.0.1:8765/ad.html"><input type="hidden" name="q" value="x"><button>14 Formular fremd</button></form>
+<p>Skript-Regeln: <b id=sr>aus</b></p>
+<p>nur ohne Filter sichtbar</p>
+<script>sr.textContent = (window.ruheScriptlet === true ? "aktiv" : "aus") + (window.ruheUbo === true ? " + uBlock" : "")</script>
+<p id=ad>Werbe-Skript: <b id=adstate>blockiert</b></p>
+<script src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js" onload="adstate.textContent='GELADEN'"></script>
+<p>Besuche (localStorage/Cookie): <b id=n></b></p>
+<script>localStorage.v=(+localStorage.v||0)+1;var c=(+(document.cookie.match(/v=(\d+)/)||[0,0])[1])+1;document.cookie='v='+c+';max-age=99999';n.textContent=localStorage.v+' / '+c</script>
