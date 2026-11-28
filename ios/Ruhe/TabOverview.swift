@@ -6,13 +6,14 @@ struct TabOverview: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.dynamicTypeSize) private var textSize
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var search = ""
 
     var body: some View {
         NavigationStack {
             ScrollViewReader { scroll in
                 ScrollView {
                     LazyVGrid(columns: [column], alignment: .leading, spacing: 14) {
-                        ForEach(session.tabs, id: \.self) { tab in
+                        ForEach(TabSearchView.matches(session.tabs, search), id: \.self) { tab in
                             TabCard(tab: tab, isCurrent: tab === session.current) {
                                 session.select(tab)
                                 dismiss()
@@ -30,6 +31,7 @@ struct TabOverview: View {
                 }
                 .background(Color(uiColor: .systemGroupedBackground))
                 .navigationTitle("Tabs")
+                .searchable(text: $search, prompt: L("Tabs suchen", "Search tabs"))
                 .toolbar {
                     if !session.closedTabs.isEmpty {
                         ToolbarItem(placement: .cancellationAction) {
@@ -82,9 +84,17 @@ private struct TabCard: View {
                 pagePreview
                 HStack(spacing: 8) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(tab.label)
-                            .font(.subheadline.weight(.semibold))
-                            .lineLimit(2)
+                        HStack(spacing: 5) {
+                            if tab.isPrivate {
+                                Image(systemName: "eye.slash")
+                                    .font(.caption)
+                                    .foregroundStyle(.purple)
+                                    .accessibilityLabel(L("Privater Tab", "Private tab"))
+                            }
+                            Text(tab.label)
+                                .font(.subheadline.weight(.semibold))
+                                .lineLimit(2)
+                        }
                         if let host = tab.address?.host, host != tab.label {
                             Text(host)
                                 .font(.caption)
@@ -139,7 +149,7 @@ private struct TabCard: View {
                         .resizable()
                         .scaledToFill()
                 } else {
-                    Image(systemName: tab.address == nil ? "shield.lefthalf.filled" : "globe")
+                    Image(systemName: tab.isPrivate ? "eye.slash" : tab.address == nil ? "shield.lefthalf.filled" : "globe")
                         .font(.largeTitle.weight(.light))
                         .foregroundStyle(.secondary)
                 }

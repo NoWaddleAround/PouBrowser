@@ -1,23 +1,24 @@
 package com.nowaddlearound.poubrowser
 
 import android.content.Context
-import android.util.AtomicFile
 import android.util.Log
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import okhttp3.HttpUrl
 import okhttp3.OkHttpClient
-import okhttp3.Request
 import org.json.JSONObject
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.ByteArrayInputStream
-import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.File
 import java.io.IOException
-import java.security.MessageDigest
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption.ATOMIC_MOVE
+import java.nio.file.StandardCopyOption.REPLACE_EXISTING
+import java.util.Properties
+import java.util.UUID
 import java.util.concurrent.Callable
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
@@ -33,8 +34,7 @@ internal class TrackerBlocker(private val context: Context) {
     private class FilterList(val name: String, val days: Long, vararg val addresses: String)
 
     private val folder = File(context.filesDir, "filters")
-    private val rawFolder = File(folder, "raw")
-    private val cacheFile = File(folder, "engine.bin")
+    private val manifest = File(folder, "installed.properties")
     private val preferences = context.getSharedPreferences("tracker-filter", Context.MODE_PRIVATE)
     private val worker = Executors.newSingleThreadExecutor()
     private val busy = AtomicBoolean()
@@ -107,18 +107,18 @@ internal class TrackerBlocker(private val context: Context) {
     private fun asset(name: String) = context.assets.open(name).bufferedReader().use { it.readText() }
 
     /** `page` is the page the request belongs to; null for service workers, which get the page-independent rules only. */
-    fun intercept(request: WebResourceRequest, page: HttpUrl? = null, enabled: Boolean = true): WebResourceResponse? {
+    fun intercept(request: WebResourceRequest, page: HttpUrl? = null, type: Int = typeOf(request)): WebResourceResponse? {
         val scheme = request.url.scheme
-        if (!enabled || request.isForMainFrame || (scheme != "http" && scheme != "https")) return null
+        if (request.isForMainFrame || (scheme != "http" && scheme != "https")) return null
         val host = request.url.host?.lowercase()?.trimEnd('.') ?: return null
         ready.await(3, TimeUnit.SECONDS)
         if (page != null && exemptions(page) and FilterEngine.EXEMPT_ALL != 0) return null
         // Rules speak about the document a request comes from. Inside an embedded frame (a video player)
         // that is the frame, which the Referer header names, not the page around it.
         val from = request.requestHeaders["Referer"]?.let(BrowserPolicy::webUrl)?.host ?: page?.host
-        if (!engine.blocks(request.url.toString(), host, from, typeOf(request))) return null
+        if (!engine.blocks(request.url.toString(), host, from, type)) return null
         // To see what gets dropped on a page that breaks: adb shell setprop log.tag.PouBlock DEBUG
-        if (Log.isLoggable("PouBlock", Log.DEBUG)) Log.d("PouBlock", typeOf(request).toString() + " " + request.url + " from " + from)
+        if (Log.isLoggable("PouBlock", Log.DEBUG)) Log.d("PouBlock", type.toString() + " " + request.url + " from " + from)
         return WebResourceResponse(
             "text/plain", "UTF-8", 403, "Blocked by PouBrowser",
             mapOf("Cache-Control" to "no-store"), ByteArrayInputStream(byteArrayOf()),
@@ -140,8 +140,28 @@ internal class TrackerBlocker(private val context: Context) {
         val originPageScript: String?,
     )
 
+    /**
+     * The last few plans, for the next navigation on the same host and for switching between tabs. On a host
+     * with `#@#` exceptions (google.com, youtube.com, ebay.de) the plan rebuilds the whole generic sheet,
+     * about 650 KB and 10-30 ms on the UI thread, two or three times per page load.
+     */
+    private val planCache = object : LinkedHashMap<String, ScriptPlan>(8, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ScriptPlan>) = size > 4
+    }
+    private var planEngine: FilterEngine? = null
+
     fun planScripts(page: HttpUrl): ScriptPlan {
         val exempt = exemptions(page)
+        val engine = engine
+        val key = "${page.host}|$exempt"
+        synchronized(planCache) {
+            if (planEngine !== engine) { planCache.clear(); planEngine = engine }
+            planCache[key]?.let { return it }
+        }
+        return plan(page, engine, exempt).also { synchronized(planCache) { if (planEngine === engine) planCache[key] = it } }
+    }
+
+    private fun plan(page: HttpUrl, engine: FilterEngine, exempt: Int): ScriptPlan {
         if (exempt and (FilterEngine.EXEMPT_ALL or FilterEngine.EXEMPT_COSMETIC) != 0) {
             return ScriptPlan(useWildcardGeneric = false, customGenericOriginScript = null, originPageScript = null)
         }
@@ -193,7 +213,7 @@ internal class TrackerBlocker(private val context: Context) {
     }
 
     /** Adds a style sheet as early as the document allows: at document start there may be no root element yet. */
-    private fun styleScript(css: String) =
+    fun styleScript(css: String) =
         "(()=>{const s=document.createElement('style');s.textContent=${quote(css)};" +
             "const put=()=>{const r=document.head||document.documentElement;if(r)r.appendChild(s);return !!r};" +
             "if(!put())new MutationObserver((m,o)=>{if(put())o.disconnect()}).observe(document,{childList:true,subtree:true})})();"
@@ -209,38 +229,67 @@ internal class TrackerBlocker(private val context: Context) {
         if (!busy.compareAndSet(false, true)) return
         worker.execute {
             try {
+                folder.mkdirs()
+                val installed = Properties()
+                if (manifest.exists()) manifest.inputStream().use(installed::load)
                 if (ready.count > 0) {
-                    load(rebuildCache = false)
+                    restore(installed)
                     opened()
                 }
                 val now = System.currentTimeMillis()
-                val due = lists.filter {
-                    val age = now - preferences.getLong("updated." + it.name, 0)
-                    force || !file(it).exists() || age !in 0 until TimeUnit.DAYS.toMillis(it.days)
+                val due = lists.filter { list ->
+                    val age = now - preferences.getLong("updated." + list.name, 0)
+                    val directory = activeDirectory(list, installed)
+                    force || directory == null || list.addresses.indices.any { !File(directory, "$it.txt").isFile } ||
+                        age !in 0 until TimeUnit.DAYS.toMillis(list.days)
                 }
                 if (due.isEmpty()) return@execute
+                // An interrupted manual refresh must be retried even if its original interval has not expired.
+                val pending = preferences.edit()
+                due.forEach { pending.remove("updated." + it.name) }
+                if (!pending.commit()) throw IOException("Could not schedule filter update")
                 status = L("Filterlisten werden geladen …", "Loading filter lists …")
-
                 val pool = Executors.newFixedThreadPool(minOf(due.size, 3))
                 val results = try {
-                    pool.invokeAll(due.map { list -> Callable { list to download(list, allowNotModified = !force && file(list).exists()) } })
-                        .map { it.get() }
+                    pool.invokeAll(due.map { list -> Callable {
+                        val slot = if (installed.getProperty(list.name) == "a") "b" else "a"
+                        val changed = try {
+                            FilterSources.stage(client, list.addresses.toList(), activeDirectory(list, installed),
+                                File(folder, list.name + "-" + slot))
+                        } catch (_: IOException) {
+                            null
+                        }
+                        Triple(list, slot, changed)
+                    } }).map { it.get() }
                 } finally {
                     pool.shutdown()
                 }
 
-                val failed = ArrayList<FilterList>()
-                var anyChanged = false
-                for ((list, outcome) in results) {
-                    when (outcome) {
-                        DownloadOutcome.CHANGED -> anyChanged = true
-                        DownloadOutcome.NOT_MODIFIED -> Unit
-                        DownloadOutcome.FAILED -> failed.add(list)
-                    }
+                val next = Properties().also { it.putAll(installed) }
+                val fresh = preferences.edit()
+                for ((list, slot, changed) in results) {
+                    if (changed == true) next.setProperty(list.name, slot)
+                    if (changed != null) fresh.putLong("updated." + list.name, now)
                 }
-                if (anyChanged || version == 0) load(rebuildCache = true)
-                else updateStatusFromCurrentEngine()
-                if (failed.isNotEmpty()) status += L(" · Aktualisierung fehlgeschlagen: ", " · Update failed: ") + failed.joinToString { it.name }
+                if (next != installed) {
+                    next.setProperty("revision", UUID.randomUUID().toString())
+                    val built = buildEngine(next) ?: throw IOException("Missing filter sources")
+                    next.setProperty("snapshot", if (installed.getProperty("snapshot") == "a") "b" else "a")
+                    writeSnapshot(built, stamp(next), snapshot(next))
+                    val stage = File(folder, "installed.next")
+                    stage.outputStream().use { next.store(it, null) }
+                    Files.move(stage.toPath(), manifest.toPath(), ATOMIC_MOVE, REPLACE_EXISTING)
+                    activate(built)
+                }
+                fresh.apply()
+                if (version > 0) updateStatusFromCurrentEngine()
+                else status = L("Werbeblocker: nur Grundschutz", "Ad blocker: basic protection only")
+                val failed = results.filter { it.third == null }
+                if (failed.isNotEmpty()) status += L(" · Aktualisierung fehlgeschlagen: ", " · Update failed: ") +
+                    failed.joinToString { it.first.name }
+            } catch (error: Exception) {
+                status = L("Filteraktualisierung fehlgeschlagen", "Filter update failed")
+                Log.w("PouBlock", status, error)
             } finally {
                 opened()
                 busy.set(false)
@@ -248,126 +297,72 @@ internal class TrackerBlocker(private val context: Context) {
         }
     }
 
-    private enum class DownloadOutcome { CHANGED, NOT_MODIFIED, FAILED }
+    private fun activeDirectory(list: FilterList, installed: Properties): File? =
+        installed.getProperty(list.name)?.takeIf { it == "a" || it == "b" }?.let { File(folder, list.name + "-" + it) }
 
-    private fun file(list: FilterList) = File(folder, list.name + ".txt")
+    private fun legacy(list: FilterList) = File(folder, list.name + ".txt")
 
-    private fun rawPartFile(address: String): File {
-        val digest = MessageDigest.getInstance("SHA-256").digest(address.toByteArray(Charsets.UTF_8))
-            .joinToString("") { "%02x".format(it) }
-        return File(rawFolder, "$digest.txt")
-    }
-
-    private fun download(list: FilterList, allowNotModified: Boolean): DownloadOutcome = try {
-        rawFolder.mkdirs()
-        val data = ByteArrayOutputStream()
-        var anyPartChanged = !allowNotModified
-        for (address in list.addresses) {
-            val partCache = rawPartFile(address)
-            val requestBuilder = Request.Builder().url(address)
-            if (allowNotModified && partCache.exists()) {
-                preferences.getString("etag.$address", null)?.let { requestBuilder.header("If-None-Match", it) }
-                preferences.getString("lastmod.$address", null)?.let { requestBuilder.header("If-Modified-Since", it) }
-            }
-            client.newCall(requestBuilder.build()).execute().use { response ->
-                if (response.code == 304 && partCache.exists()) {
-                    data.write(partCache.readBytes())
-                    data.write('\n'.code)
-                    return@use
-                }
-                val body = response.body
-                if (!response.isSuccessful || body == null) throw IOException("HTTP " + response.code)
-                val buffer = body.source()
-                if (buffer.request(maxBytes + 1)) throw IOException(L("Filterdatei zu groß", "Filter file too large"))
-                val bytes = buffer.readByteArray()
-                anyPartChanged = true
-                runCatching { partCache.writeBytes(bytes) }
-                val editor = preferences.edit()
-                response.header("ETag")?.let { editor.putString("etag.$address", it) }
-                response.header("Last-Modified")?.let { editor.putString("lastmod.$address", it) }
-                editor.apply()
-                data.write(bytes)
-                data.write('\n'.code)
-            }
-        }
-        val now = System.currentTimeMillis()
-        if (!anyPartChanged && file(list).exists()) {
-            preferences.edit().putLong("updated." + list.name, now).apply()
-            DownloadOutcome.NOT_MODIFIED
-        } else {
-            folder.mkdirs()
-            val target = AtomicFile(file(list))
-            val output = target.startWrite()
-            try {
-                data.writeTo(output)
-                target.finishWrite(output)
-            } catch (error: IOException) {
-                target.failWrite(output)
-                throw error
-            }
-            preferences.edit().putLong("updated." + list.name, now).apply()
-            DownloadOutcome.CHANGED
-        }
-    } catch (_: IOException) {
-        DownloadOutcome.FAILED   // the copy from last time stays in use
-    }
-
-    private fun currentStamp(): String = buildString {
+    private fun stamp(installed: Properties): String = buildString {
+        installed.getProperty("revision")?.let { append(it).append(';') }
         for (list in lists) {
-            val saved = file(list)
+            if (activeDirectory(list, installed) != null) continue
+            val saved = legacy(list)
             if (saved.exists()) append(list.name).append(':').append(saved.length()).append(':').append(saved.lastModified()).append(';')
         }
     }
 
-    /** Reads the pre-parsed binary snapshot if current, else parses the saved text lists and writes a fresh snapshot. */
-    private fun load(rebuildCache: Boolean) {
-        val stamp = currentStamp()
-        if (!rebuildCache && stamp.isNotEmpty() && cacheFile.exists()) {
-            val cached = runCatching {
-                DataInputStream(BufferedInputStream(cacheFile.inputStream())).use { FilterEngine.readFrom(it, stamp) }
-            }.getOrNull()
-            if (cached != null) {
-                engine = cached
-                exempt = "" to 0
-                version++
-                updateStatusFromCurrentEngine()
-                return
-            }
-        }
-
+    private fun buildEngine(installed: Properties): FilterEngine? {
         val builder = FilterEngine.Builder()
         seed.lineSequence().forEach(builder::add)
-        var found = 0
+        var found = false
         for (list in lists) {
-            val saved = file(list).takeIf { it.exists() } ?: continue
-            runCatching { saved.bufferedReader().useLines { it.forEach(builder::add) } }.onSuccess { found++ }
+            val dir = activeDirectory(list, installed)
+            if (dir != null) FilterSources.read(dir, list.addresses.toList(), builder::add)
+            else if (legacy(list).isFile) legacy(list).bufferedReader().useLines { it.forEach(builder::add) }
+            else continue
+            found = true
         }
-        if (found > 0) {
-            val built = builder.build()
-            engine = built
-            exempt = "" to 0
-            version++
-            val freshStamp = currentStamp()
-            runCatching {
-                folder.mkdirs()
-                val atomic = AtomicFile(cacheFile)
-                val stream = atomic.startWrite()
-                try {
-                    DataOutputStream(BufferedOutputStream(stream)).use {
-                        built.writeTo(it, freshStamp)
-                        it.flush()
-                    }
-                    atomic.finishWrite(stream)
-                } catch (e: IOException) {
-                    atomic.failWrite(stream)
+        return if (found) builder.build() else null
+    }
+
+    private fun activate(built: FilterEngine) {
+        engine = built
+        exempt = "" to 0
+        version++
+        updateStatusFromCurrentEngine()
+    }
+
+    private fun snapshot(installed: Properties) = when (installed.getProperty("snapshot")) {
+        "a" -> File(folder, "engine-a.bin")
+        "b" -> File(folder, "engine-b.bin")
+        else -> File(folder, "engine.bin")
+    }
+
+    private fun restore(installed: Properties) {
+        val stamp = stamp(installed)
+        if (stamp.isEmpty()) return
+        val cached = runCatching {
+            DataInputStream(BufferedInputStream(snapshot(installed).inputStream())).use { FilterEngine.readFrom(it, stamp) }
+        }.getOrNull()
+        if (cached != null) {
+            activate(cached)
+        } else {
+            // A missing source must not stop the download that repairs it.
+            try {
+                buildEngine(installed)?.let { built ->
+                    activate(built)
+                    writeSnapshot(built, stamp, snapshot(installed))
                 }
+            } catch (error: IOException) {
+                Log.w("PouBlock", "Could not restore filter snapshot", error)
             }
         }
-        if (found == 0) {
-            status = L("Werbeblocker: nur Grundschutz, Filterlisten fehlen", "Ad blocker: basic protection only, filter lists missing")
-        } else {
-            updateStatusFromCurrentEngine()
-        }
+    }
+
+    private fun writeSnapshot(built: FilterEngine, stamp: String, destination: File) {
+        val stage = File(folder, "engine.next")
+        DataOutputStream(BufferedOutputStream(stage.outputStream())).use { built.writeTo(it, stamp) }
+        Files.move(stage.toPath(), destination.toPath(), ATOMIC_MOVE, REPLACE_EXISTING)
     }
 
     private fun updateStatusFromCurrentEngine() {
@@ -376,13 +371,13 @@ internal class TrackerBlocker(private val context: Context) {
     }
 
     companion object {
-        private const val maxBytes = 16L * 1024 * 1024
-
         // The lists of the iOS app, in their Android editions where AdGuard has one.
         private val lists = listOf(
             FilterList("adguard-base", 3, "https://filters.adtidy.org/android/filters/2.txt"),
             FilterList("adguard-mobile", 3, "https://filters.adtidy.org/android/filters/11.txt"),
             FilterList("adguard-popups", 3, "https://filters.adtidy.org/android/filters/19.txt"),
+            // Mostly hiding rules and click-away scriptlets: they reach pages through the same page scripts.
+            FilterList("adguard-cookies", 3, "https://filters.adtidy.org/android/filters/18.txt"),
             FilterList("easyprivacy", 3, "https://easylist.to/easylist/easyprivacy.txt"),
             // "Quick fixes" changes several times a day, hence the daily refresh.
             FilterList(

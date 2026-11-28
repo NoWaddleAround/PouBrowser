@@ -1,7 +1,26 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Only when a site asks and the user allows it, as in Chrome. -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <!-- Sound keeps playing in the background, with the media notification (as in Chrome). -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-feature android:name="android.software.picture_in_picture" android:required="false" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+    <uses-feature android:name="android.hardware.location" android:required="false" />
+
+    <!-- Android payment apps that PaymentRequest may open. -->
+    <queries>
+        <intent><action android:name="org.chromium.intent.action.PAY" /></intent>
+        <intent><action android:name="org.chromium.intent.action.IS_READY_TO_PAY" /></intent>
+        <intent><action android:name="org.chromium.intent.action.UPDATE_PAYMENT_DETAILS" /></intent>
+    </queries>
 
     <application
         android:name=".PouBrowserApp"
@@ -34,5 +53,9 @@
                 <data android:scheme="https" />
             </intent-filter>
         </activity>
+        <service
+            android:name=".MediaService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
     </application>
 </manifest>

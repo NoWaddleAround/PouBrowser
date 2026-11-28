@@ -2,20 +2,42 @@ import PublicSuffixList
 import UIKit
 import WebKit
 
+#if targetEnvironment(macCatalyst)
+private final class CatalystWebView: WKWebView {
+    private lazy var formNavigationCommands: [UIKeyCommand] = {
+        let actions: [(UIKeyModifierFlags, String)] = [([], "_nextAccessoryTab:"), (.shift, "_previousAccessoryTab:")]
+        return actions.compactMap { modifiers, name in
+            let action = NSSelectorFromString(name)
+            guard responds(to: action) else { return nil }
+            let command = UIKeyCommand(input: "\t", modifierFlags: modifiers, action: action)
+            // Route Tab to WebKit's form navigation before Catalyst's focus engine handles it.
+            command.wantsPriorityOverSystemBehavior = true
+            return command
+        }
+    }()
+
+    override var keyCommands: [UIKeyCommand]? { (super.keyCommands ?? []) + formNavigationCommands }
+}
+#endif
+
 struct Notice: Equatable {
     let id = UUID()
     var text: String
     var symbol = "hand.raised.fill"
     /// What was blocked, so the user can still open it on purpose.
     var url: URL?
+    /// A button of its own instead of "Open".
+    var action: (title: String, run: @MainActor () -> Void)?
+
+    static func == (a: Notice, b: Notice) -> Bool { a.id == b.id }
 }
 
 /// One tab: its web view plus the rules that keep pages from opening popups, hijacking the tab or
 /// jumping into other apps. A tab can sleep: then it has no web view and no page process, only its
 /// address, history and reading position.
 @MainActor @Observable
-final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate {
-    @ObservationIgnored private unowned let session: Session
+final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, UIGestureRecognizerDelegate {
+    @ObservationIgnored unowned let session: Session
     /// Nil while the tab sleeps. The tab in front always has one.
     private(set) var webView: WKWebView!
     private(set) var url: URL?
@@ -32,6 +54,8 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate {
     private(set) var hasCommittedPage = false
     /// A video has played on this page, so the picture-in-picture button has something to act on.
     private(set) var hasVideo = false
+    /// Requests the filter lists stopped on the page in front.
+    private(set) var blocked = 0
 
     @ObservationIgnored private var observations = [NSKeyValueObservation]()
     @ObservationIgnored private var previewRequest: UUID?
@@ -78,14 +102,31 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate {
     @ObservationIgnored private var crashes = 0
     @ObservationIgnored private var lastCrash = Date.distantPast
 
+    /// The tab's sound is off (Chrome's "Tab stummschalten"); kept when the tab sleeps and wakes.
+    private(set) var isMuted = false
+
+    /// Developer tools (`DevTools.swift`): console lines of the page in front and what the filter lists stopped there.
+    var devLog = [DevEntry]()
+    var blockedURLs = [String]()
+    @ObservationIgnored var capturesConsole = false
+
+    /// Downloads in flight: where each goes, and which keep only their sound (`Downloads.swift`).
+    @ObservationIgnored var downloadTargets = [ObjectIdentifier: URL]()
+    @ObservationIgnored var audioDownloads = Set<ObjectIdentifier>()
+    @ObservationIgnored var downloadItems = [ObjectIdentifier: DownloadItem]()
+    /// Pinned tabs stay at the front of the strip, small, without a close button (as in Chrome).
+    var isPinned = false
+
     /// Frame whose video played last, to reach that video when the app leaves the screen.
     @ObservationIgnored private var mediaFrame: WKFrameInfo?
 
     /// Back/forward list and page state of a sleeping tab.
     @ObservationIgnored private var state: Any?
     /// A hidden tab that plays sound is not put to sleep.
-    @ObservationIgnored private(set) var isPlaying = false
+    private(set) var isPlaying = false
 
+    private static let iPadUserAgent =
+        "Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
     private static let desktopUserAgent =
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
 
@@ -107,6 +148,10 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate {
         !session.scriptlessSites.contains(Self.site(url) ?? "")
     }
 
+    private func popupsAllowed(on url: URL?) -> Bool {
+        session.popupSites.contains(Self.site(url) ?? "")
+    }
+
     private func filteringAllowed(on url: URL?) -> Bool {
         !session.unfilteredSites.contains(Self.site(url) ?? "")
     }
@@ -125,13 +170,32 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate {
         }
     }
 
+    /// Real popup windows for sign-ins (Google, PayPal, 3-D Secure). They open as a tab and keep `window.opener`.
+    var popupsAllowed: Bool {
+        get { popupsAllowed(on: address) }
+        set {
+            guard let site = Self.site(address) else { return }
+            session.setPopups(allowed: newValue, on: site)
+            reload()
+        }
+    }
+
     var scriptsAllowed: Bool {
         get { scriptsAllowed(on: address) }
         set {
             guard let site = Self.site(address) else { return }
             session.setScripts(allowed: newValue, on: site)
-            reload()
         }
+    }
+
+    /// Page zoom of the site in front (1 = 100 %).
+    var zoom: Double { session.zoom(on: Self.site(address)) }
+
+    /// `step` +0.1 or -0.1; nil resets to 100 %. Applies now and to every later page of the site.
+    func changeZoom(by step: Double?) {
+        guard let site = Self.site(address) else { return }
+        session.setZoom(step.map { zoom + $0 }, on: site)
+        webView?.pageZoom = zoom
     }
 
     var desktopMode: Bool {
@@ -144,8 +208,16 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate {
         }
     }
 
-    init(session: Session, url: URL? = nil, title: String? = nil, scroll: Double = 0) {
+    /// A private tab keeps cookies and storage in memory only, records no history and is not restored.
+    let isPrivate: Bool
+    /// Mac: the link under the pointer, shown at the bottom left.
+    var hoverLink = ""
+    /// alert/confirm/prompt shown on this page. Pages that loop them get no more after a few.
+    @ObservationIgnored var dialogs = 0
+
+    init(session: Session, url: URL? = nil, title: String? = nil, scroll: Double = 0, isPrivate: Bool = false) {
         self.session = session
+        self.isPrivate = isPrivate
         super.init()
         deferred = url   // the web view comes when the tab is first looked at
         if let title, !title.isEmpty { self.title = title }
@@ -226,7 +298,7 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate {
         committed = nil
         hasCommittedPage = false
         isPlaying = false
-        session.log("TAB schläft: \(label)")
+        log("TAB schläft: \(label)")
     }
 
     private func wake() {
@@ -301,8 +373,13 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate {
 
     /// Tells the page's video that the app is leaving the screen, so the pause iOS is about to cause gets undone.
     func leaving(floating: Bool) {
+        #if targetEnvironment(macCatalyst)
+        // The Mac pauses nothing when another app comes to the front: no pause to undo, no full screen to close.
+        if floating { runInMediaFrame("ruheFloat()") }
+        #else
         if !floating { webView?.closeAllMediaPresentations {} }
         runInMediaFrame(floating ? "ruheLeaving(); ruheFloat()" : "ruheLeaving()")
+        #endif
     }
     func returned() { runInMediaFrame("ruheBack(); ruheLand()") }
     /// Shows the track and jumps to a line of dialogue, so a screenshot can prove it is drawn.
@@ -323,25 +400,90 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate {
         runInMediaFrame(Session.off("testSubtitles") ? Self.subtitleTest : "ruheToggleFloat()")
     }
 
+    /// `pouVideo` from `Resources/media.js`, in the frame whose video played last (else the page itself).
+    func videoTool(_ action: String, _ value: Double) {
+        guard let webView else { return }
+        Task {
+            let answer = try? await webView.callAsyncJavaScript("return pouVideo(action, value)", arguments: ["action": action, "value": value],
+                                                                in: mediaFrame, contentWorld: .defaultClient) as? String
+            let parts = (answer ?? "none").split(separator: ":")
+            let number = parts.count > 1 ? Double(parts[1]) ?? 0 : 0
+            switch parts.first {
+            case "speed": show(L("Tempo ", "Speed ") + number.formatted() + "×", symbol: "speedometer")
+            case "seek": show((number > 0 ? "+" : "") + number.formatted() + " s", symbol: "goforward")
+            case "boost": show(L("Lautstärke ", "Volume ") + "\(Int(number * 100)) %", symbol: "speaker.wave.3")
+            case "boost-foreign": show(L("Lauter geht hier nicht: Ton kommt von fremdem Server", "Can't boost: sound comes from another server"),
+                                       symbol: "speaker.slash")
+            default: show(L("Kein Video gefunden", "No video found"), symbol: "play.slash")
+            }
+        }
+    }
+
+    /// Chrome's and Safari's "Copy link to highlight": the address with a text fragment (`#:~:text=`) of the selection.
+    func copyHighlightLink() {
+        guard let webView, let page = address else { return }
+        Task {
+            let selected = (try? await webView.evaluateJavaScript("String(getSelection())", in: nil, contentWorld: .defaultClient) as? String) ?? ""
+            guard let link = Self.highlightLink(page, selected) else {
+                return show(L("Erst Text auf der Seite markieren", "Select text on the page first"), symbol: "character.cursor.ibeam")
+            }
+            UIPasteboard.general.string = link.absoluteString
+            show(L("Link zur Textstelle kopiert", "Link to highlight copied"), symbol: "link")
+        }
+    }
+
+    /// The whole text when short, else its first and last five words (`start,end`). `-`, `,` and `&` are escaped too.
+    nonisolated static func highlightLink(_ page: URL, _ selected: String) -> URL? {
+        let words = selected.split(whereSeparator: \.isWhitespace)
+        guard !words.isEmpty else { return nil }
+        let encode = { (text: String) in
+            text.addingPercentEncoding(withAllowedCharacters: CharacterSet.urlQueryAllowed.subtracting(CharacterSet(charactersIn: "-,&#=?+")))
+                ?? text
+        }
+        let fragment = words.count <= 10 && selected.count <= 300
+            ? encode(words.joined(separator: " "))
+            : encode(words.prefix(5).joined(separator: " ")) + "," + encode(words.suffix(5).joined(separator: " "))
+        var components = URLComponents(url: page, resolvingAgainstBaseURL: false)
+        components?.fragment = nil
+        return components?.url.flatMap { URL(string: $0.absoluteString + "#:~:text=" + fragment) }
+    }
+
     private func runInMediaFrame(_ call: String) {
         guard let mediaFrame, let webView else { return }
         webView.evaluateJavaScript(call, in: mediaFrame, in: .defaultClient)
     }
 
-    private func log(_ entry: String) { session.log(entry) }
+    /// Private tabs leave no trace: the log is a file on disk.
+    func log(_ entry: String) { if !isPrivate { session.log(entry) } }
 
-    nonisolated static func destination(for text: String) -> URL {
-        if !text.contains(" "), text.contains("."),
-           let url = URL(string: text.contains("://") ? text : "https://" + text), url.host != nil {
+    func setMuted(_ muted: Bool) {
+        isMuted = muted
+        if let webView { Self.mute(webView, muted) }
+    }
+
+    /// WebKit's own page mute (`_setPageMuted:`, private, checked first; 1 = audio muted), as Safari uses it.
+    private static func mute(_ view: WKWebView, _ muted: Bool) {
+        typealias SetMuted = @convention(c) (AnyObject, Selector, UInt) -> Void
+        let selector = NSSelectorFromString("_setPageMuted:")
+        guard view.responds(to: selector) else { return }
+        unsafeBitCast(view.method(for: selector), to: SetMuted.self)(view, selector, muted ? 1 : 0)
+    }
+
+    nonisolated static func destination(for text: String, engine: SearchEngine = .current) -> URL {
+        // "localhost:8080" has no dot but is an address; it is served without TLS.
+        let local = text.lowercased().hasPrefix("localhost")
+        if !text.contains(" "), text.contains(".") || text.contains("://") || local,
+           let url = URL(string: text.contains("://") ? text : (local ? "http://" : "https://") + text), url.host != nil {
             return cleanURL(url)
         }
-        var search = URLComponents(string: "https://duckduckgo.com/")!
-        search.queryItems = [URLQueryItem(name: "q", value: text)]
+        var search = URLComponents(string: engine.base)!
+        search.queryItems = [URLQueryItem(name: engine.parameter, value: text)]
         return search.url!
     }
 
     /// Strips known ad and campaign click-ID parameters while leaving login/OAuth callbacks untouched.
     nonisolated static func cleanURL(_ url: URL) -> URL {
+        if let target = unwrapped(url) { return cleanURL(target) }
         guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https",
               url.query != nil,
               var components = URLComponents(url: url, resolvingAgainstBaseURL: false),
@@ -357,6 +499,38 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate {
         return components.url ?? url
     }
 
+    /// The home network and this device, which mostly have no HTTPS: localhost, LAN addresses, `.local`, single names.
+    nonisolated static func isLocal(_ url: URL) -> Bool {
+        guard let host = url.host?.lowercased() else { return true }
+        if host == "localhost" || host.hasSuffix(".local") || host.hasSuffix(".localhost") || !host.contains(".") { return true }
+        let parts = host.split(separator: ".").compactMap { Int($0) }
+        guard parts.count == 4 else { return host.hasPrefix("fe80:") || host.hasPrefix("fc") || host.hasPrefix("fd") || host == "::1" }
+        return parts[0] == 10 || parts[0] == 127 || (parts[0] == 192 && parts[1] == 168)
+            || (parts[0] == 172 && (16...31).contains(parts[1])) || (parts[0] == 169 && parts[1] == 254)
+    }
+
+    /// Link wrappers that only bounce to the real address and log the click (Brave's "debouncing").
+    nonisolated static func unwrapped(_ url: URL) -> URL? {
+        guard let host = url.host?.lowercased(), let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
+        let bare = host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
+        let path = components.path.lowercased()
+        let names: [String]
+        if bare.hasPrefix("google.") && path == "/url" { names = ["q", "url"] }
+        else if (bare == "l.facebook.com" || bare == "lm.facebook.com") && path == "/l.php" { names = ["u"] }
+        else if bare == "l.instagram.com" { names = ["u"] }
+        else if bare == "out.reddit.com" { names = ["url"] }
+        else if (bare == "youtube.com" || bare == "m.youtube.com") && path == "/redirect" { names = ["q"] }
+        else if bare.hasSuffix(".safelinks.protection.outlook.com") { names = ["url"] }
+        else if bare == "steamcommunity.com" && path.hasPrefix("/linkfilter") { names = ["url", "u"] }
+        else if bare == "vk.com" && path == "/away.php" { names = ["to"] }
+        else if bare == "slack-redir.net" && path == "/link" { names = ["url"] }
+        else { return nil }
+        let value = names.lazy.compactMap { name in components.queryItems?.first { $0.name == name }?.value }.first
+        guard let value, let target = URL(string: value), target.host != nil,
+              ["http", "https"].contains(target.scheme?.lowercased() ?? "") else { return nil }
+        return target
+    }
+
     /// Registrable domain ("bbc.co.uk" for "www.bbc.co.uk"): the unit a script may not leave by itself.
     nonisolated static func site(_ url: URL?) -> String? {
         guard let host = url?.host?.lowercased() else { return nil }
@@ -367,33 +541,75 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate {
 
     private func applyUserAgent(for targetURL: URL?) {
         guard !Session.off("noAgent"), !Session.off("plain"), !Session.off("plainConfig") else { return }
+        #if targetEnvironment(macCatalyst)
+        // Catalyst's WebKit has no MediaSource (also not with WebKit's own switch), and desktop YouTube plays only
+        // through it: "Es ist ein Fehler aufgetreten". As an iPad it gets HLS, which plays.
+        if Self.site(targetURL) == "youtube.com" {
+            webView?.customUserAgent = Self.iPadUserAgent
+            return
+        }
+        #endif
         webView?.customUserAgent = desktopAllowed(on: targetURL) ? Self.desktopUserAgent : nil
     }
 
-    private func makeWebView() {
-        var config = WKWebViewConfiguration()
+    /// A popup the page opened: its web view must be built from WebKit's configuration, which ties it to the opener.
+    func adopt(_ configuration: WKWebViewConfiguration) -> WKWebView {
+        makeWebView(using: configuration)
+        return webView
+    }
+
+    private func makeWebView(using given: WKWebViewConfiguration? = nil) {
+        var config = given ?? WKWebViewConfiguration()
         controller = session.makeController()
-        session.pageScripts.forEach(controller.addUserScript)
+        session.pageScripts().forEach(controller.addUserScript)
         config.userContentController = controller
         config.preferences.javaScriptCanOpenWindowsAutomatically = false
         // Sound needs a tap, as in Safari. Asking a tap for every video (`.all`) also keeps players from
         // loading any video data, and one that waits for that data never shows its play button (kaa.to).
         config.mediaTypesRequiringUserActionForPlayback = Session.off("autoplay") ? [] : .audio
         config.allowsInlineMediaPlayback = true
+        // Private tabs get their own throwaway storage and no extensions, which could read along.
+        if given != nil {
+            // A popup keeps its opener's storage (a private opener's too) and extensions.
+        } else if isPrivate {
+            config.websiteDataStore = session.privateDataStore()
+        } else {
+            config.webExtensionController = session.extensions.controller
+        }
         // Off means off: no player button, no automatic floating out of full screen.
         config.allowsPictureInPictureMediaPlayback = session.floatsVideo
         builtFloating = session.floatsVideo
         // Without the Safari part many sites serve an "open in our app" page.
+        #if targetEnvironment(macCatalyst)
+        // Players then fill the screen with their own controls and subtitles, as in Safari on the Mac.
+        config.preferences.isElementFullscreenEnabled = true
+        // Mac Safari's tail, so sites serve their desktop pages.
+        if !Session.off("noAgent") { config.applicationNameForUserAgent = "Version/\(UIDevice.current.systemVersion) Safari/605.1.15" }
+        #else
         if !Session.off("noAgent") { config.applicationNameForUserAgent = "Version/\(UIDevice.current.systemVersion) Mobile/15E148 Safari/604.1" }
+        #endif
 
         if Session.off("plain") || Session.off("plainConfig") {   // diagnosis: a web view with nothing of ours but the log
             config = WKWebViewConfiguration()
             controller = session.makeController()
             controller.removeAllContentRuleLists()
-            session.pageScripts.forEach(controller.addUserScript)
+            session.pageScripts().forEach(controller.addUserScript)
             config.userContentController = controller
         }
+        #if targetEnvironment(macCatalyst)
+        let view = CatalystWebView(frame: .zero, configuration: config)
+        #else
         let view = WKWebView(frame: .zero, configuration: config)
+        #endif
+        // Safari's Web Inspector may attach (Safari › Entwickler › this Mac or the iPhone › PouBrowser): the full
+        // element tree, which the app's own developer tools do not have.
+        view.isInspectable = true
+        // Split view: a click into this half brings the tab forward, on any page (also without JavaScript).
+        let click = UITapGestureRecognizer(target: self, action: #selector(clickedIntoView))
+        click.cancelsTouchesInView = false
+        click.delegate = self
+        view.addGestureRecognizer(click)
+        if isMuted { Self.mute(view, true) }
         view.navigationDelegate = self
         view.uiDelegate = self
         view.allowsBackForwardNavigationGestures = true
@@ -411,13 +627,23 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate {
         view.scrollView.refreshControl = refresh
 
         observations = [
-            watch(view, \.url) { $0.url = $1 },
+            watch(view, \.url) { browser, newURL in
+                browser.url = newURL
+                if !browser.isPrivate { browser.session.extensions.controller.didChangeTabProperties(.URL, for: browser) }
+            },
             watch(view, \.title) { browser, newTitle in
-                if let newTitle, !newTitle.isEmpty { browser.title = newTitle }
+                if let newTitle, !newTitle.isEmpty {
+                    browser.title = newTitle
+                    if !browser.isPrivate, let page = browser.webView?.url {
+                        browser.session.library.visited(page, title: newTitle, countsAsVisit: false)
+                    }
+                }
+                if !browser.isPrivate { browser.session.extensions.controller.didChangeTabProperties(.title, for: browser) }
             },
             watch(view, \.estimatedProgress) { $0.progress = $1 },
             watch(view, \.isLoading) { browser, loading in
                 browser.isLoading = loading
+                if !browser.isPrivate { browser.session.extensions.controller.didChangeTabProperties(.loading, for: browser) }
                 if !loading { browser.webView?.scrollView.refreshControl?.endRefreshing() }
             },
             watch(view, \.canGoBack) { $0.canGoBack = $1 },
@@ -448,8 +674,9 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate {
     }
 
     /// `lasting` notices tell the user what to do about the page in front and stay until it is loaded again.
-    func show(_ text: String, _ url: URL? = nil, symbol: String = "hand.raised.fill", lasting: Bool = false) {
-        let shown = Notice(text: text, symbol: symbol, url: url)
+    func show(_ text: String, _ url: URL? = nil, symbol: String = "hand.raised.fill", lasting: Bool = false,
+              action: (title: String, run: @MainActor () -> Void)? = nil) {
+        let shown = Notice(text: text, symbol: symbol, url: url, action: action)
         notice = shown
         staysUntilLoad = lasting
         AccessibilityNotification.Announcement(text).post()
@@ -485,6 +712,7 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate {
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         session.save()
+        if !isPrivate, let page = webView.url { session.library.visited(page, title: webView.title, countsAsVisit: true) }
         guard let target = pendingScroll, target > 0, let page = webView.url else { return }
         pendingScroll = nil
         scrollY = target
@@ -508,7 +736,8 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate {
 
     // MARK: Popup and redirect guard
 
-    private static let webSchemes: Set = ["http", "https", "about", "blob", "data"]
+    // webkit-extension: pages of installed extensions, such as their settings page.
+    private static let webSchemes: Set = ["http", "https", "about", "blob", "data", "webkit-extension"]
     private static let userActions: Set<WKNavigationType> = [
         .linkActivated, .formSubmitted, .formResubmitted, .backForward, .reload,
     ]
@@ -529,8 +758,16 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate {
         let targetURL = action.request.url
         preferences.allowsContentJavaScript = scriptsAllowed(on: targetURL)
         preferences.preferredContentMode = desktopAllowed(on: targetURL) ? .desktop : .recommended
-        if #available(iOS 18.2, *) {
-            preferences.preferredHTTPSNavigationPolicy = .userMediatedFallbackToHTTP
+        if session.httpsOnly, let targetURL, targetURL.scheme?.lowercased() == "http", let site = Self.site(targetURL), !Self.isLocal(targetURL) {
+            // Loading the same http address again while WebKit's warning page shows it is that page's "Continue".
+            // It counts for the whole site, so its subdomains do not ask again.
+            if !ownLoad, action.navigationType == .other, webView.url?.scheme == "http", webView.url?.host == targetURL.host,
+               session.httpHosts.insert(site).inserted {
+                log("NUR HTTPS: HTTP erlaubt für \(site)")
+            }
+            if !session.httpHosts.contains(site) {
+                preferences.preferredHTTPSNavigationPolicy = .userMediatedFallbackToHTTP   // WebKit's own warning page
+            }
         }
         let policy = decide(action)
         if policy != .cancel { installFilterScript(for: action) }
@@ -543,13 +780,22 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate {
               ["http", "https"].contains(url.scheme?.lowercased() ?? "") else { return }
         if target.isMainFrame {
             applyUserAgent(for: url)
+            webView?.pageZoom = session.zoom(on: Self.site(url))
             pageFiltered = filteringAllowed(on: url)
             session.blocker.setLists(on: controller, enabled: pageFiltered)
         }
         let rules = Session.off("noPageRules") || !pageFiltered ? nil : session.blocker.pageRules
         if target.isMainFrame {
             controller.removeAllUserScripts()
-            session.pageScripts.forEach(controller.addUserScript)
+            session.pageScripts(allowingPopups: popupsAllowed(on: url)).forEach(controller.addUserScript)
+            if pageFiltered {
+                controller.addUserScript(Session.privacyUserScript)
+                if session.rejectsCookies { controller.addUserScript(Session.cookieUserScript) }
+            }
+            if let selectors = Self.site(url).flatMap({ session.hiddenElements[$0] }), !selectors.isEmpty {
+                controller.addUserScript(Self.hidingScript(selectors))
+            }
+            if capturesConsole { controller.addUserScript(Self.consoleScript) }
             frameHosts = []
             hasExtendedCSSLoaded = false
             if let match = rules?.match(for: url) {
@@ -584,8 +830,23 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate {
     /// through a delegate method outside the public interface.
     @objc(_webView:contentRuleListWithIdentifier:performedAction:forURL:)
     func ruleList(_ webView: WKWebView, identifier: String, performed action: NSObject, for url: URL) {
-        guard Session.off("logBlocked"), action.value(forKey: "blockedLoad") as? Bool == true else { return }
+        guard action.value(forKey: "blockedLoad") as? Bool == true else { return }
+        blocked += 1
+        session.countBlocked()
+        if blockedURLs.count < 500 { blockedURLs.append(url.absoluteString) }
+        guard Session.off("logBlocked") else { return }
         log("GEFILTERT \(identifier): \(url.absoluteString.prefix(160))")
+    }
+
+    @objc private func clickedIntoView() {
+        if session.current !== self, session.split.contains(where: { $0 === self }) { session.select(self) }
+    }
+
+    nonisolated func gestureRecognizer(_ gesture: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool { true }
+
+    /// WebKit's own record of a real click or key press. Private API, so asked for carefully.
+    private static func isUserInitiated(_ action: WKNavigationAction) -> Bool {
+        action.responds(to: NSSelectorFromString("_isUserInitiated")) && action.value(forKey: "_isUserInitiated") as? Bool == true
     }
 
     private func decide(_ action: WKNavigationAction) -> WKNavigationActionPolicy {
@@ -597,6 +858,27 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate {
             if toMainFrame { show(L("App-Weiterleitung blockiert: ", "App redirect blocked: ") + (url.scheme ?? "")) }
             return .cancel
         }
+        if let site = Self.site(url), session.blockedSites.contains(site) {
+            log("BLOCKIERT gesperrte Seite \(toMainFrame ? "" : "im Frame ")\(url.absoluteString)")
+            if toMainFrame { show(L("Gesperrte Seite: ", "Blocked site: ") + site, symbol: "nosign") }
+            return .cancel
+        }
+        // ⌘-click or the middle button: the link in a tab behind (⇧ brings it to the front). ⌥-click: a preview
+        // card over the page. Only real clicks: a page's synthetic click with modifier keys does nothing here.
+        if action.navigationType == .linkActivated, Self.isUserInitiated(action) {
+            let flags = action.modifierFlags
+            if flags.contains(.command) || action.buttonNumber.contains(.button(3)) {
+                log("NEUER TAB per ⌘-Klick: \(url.absoluteString)")
+                session.openInNewTab(url, inBackground: !flags.contains(.shift))
+                return .cancel
+            }
+            if flags.contains(.alternate) {
+                log("VORSCHAU per ⌥-Klick: \(url.absoluteString)")
+                session.openGlance(url)
+                return .cancel
+            }
+        }
+
         // No target frame means a new window: createWebViewWith decides. Frames inside the page may load freely.
         guard let target = action.targetFrame, target.isMainFrame else { return .allow }
 
@@ -608,16 +890,6 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate {
         let fromMainFrame = (action.value(forKey: "sourceFrame") as? WKFrameInfo)?.isMainFrame ?? true
         let user = ownLoad || (fromMainFrame && Self.userActions.contains(action.navigationType))
         ownLoad = false
-
-        // Strip tracking parameters from cross-site GET link taps before contacting the destination.
-        if action.navigationType == .linkActivated,
-           (action.request.httpMethod ?? "GET").uppercased() == "GET" {
-            let cleaned = Self.cleanURL(url)
-            if cleaned != url {
-                open(cleaned)
-                return .cancel
-            }
-        }
 
         if user { userTarget = restarting ? nil : url }
         restarting = false
@@ -634,6 +906,17 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate {
         if blocked {
             blockRedirect(to: url)
             return .cancel
+        }
+        if action.shouldPerformDownload { return .download }   // <a download>
+        // Strip tracking parameters from the user's own GET link taps. Only after the guard: `open` marks
+        // the new load as the user's, so a frame's or script's link must never get here.
+        if user, fromMainFrame, action.navigationType == .linkActivated,
+           (action.request.httpMethod ?? "GET").uppercased() == "GET" {
+            let cleaned = Self.cleanURL(url)
+            if cleaned != url {
+                open(cleaned)
+                return .cancel
+            }
         }
         return Self.allowInBrowser
     }
@@ -700,10 +983,14 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate {
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
         loading = false
         userTarget = nil
-        crashes = 0
+        hoverLink = ""
         if pendingScroll == nil { scrollY = 0 }   // a new page starts at the top
         mediaFrame = nil
         hasVideo = false
+        dialogs = 0
+        blocked = 0
+        blockedURLs = []
+        devLog = []
         if committed != webView.url { discardPreview() }
         committed = webView.url
         hasCommittedPage = committed != nil
@@ -721,10 +1008,118 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate {
             show(L("Die Seite prüft den Browser und braucht dafür JavaScript. Im Zahnrad einschalten.", "This page is checking the browser and needs JavaScript for that. Switch it on in the gear menu."),
                  symbol: "exclamationmark.triangle.fill", lasting: true)
         }
-        guard response.response.mimeType == "text/calendar" || url?.pathExtension.lowercased() == "ics" else { return .allow }
-        log("BLOCKIERT Kalender-Datei: \(url?.absoluteString ?? "")")
-        show(L("Kalender-Datei blockiert: ", "Calendar file blocked: ") + (url?.host ?? ""))
-        return .cancel
+        if response.isForMainFrame, let url, [404, 410].contains((response.response as? HTTPURLResponse)?.statusCode ?? 0) {
+            offerArchive(of: url)
+        }
+        if response.response.mimeType == "text/calendar" || url?.pathExtension.lowercased() == "ics" {
+            log("BLOCKIERT Kalender-Datei: \(url?.absoluteString ?? "")")
+            show(L("Kalender-Datei blockiert: ", "Calendar file blocked: ") + (url?.host ?? ""))
+            return .cancel
+        }
+        // A file the page cannot show (zip, dmg, apk) or one sent as an attachment. The navigation to it
+        // already passed the redirect guard, so it is the user's.
+        let disposition = (response.response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Disposition") ?? ""
+        if response.isForMainFrame, !response.canShowMIMEType || disposition.lowercased().hasPrefix("attachment") {
+            return .download
+        }
+        return .allow
+    }
+
+    func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
+        started(download)
+    }
+
+    func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
+        started(download)
+    }
+
+    private func started(_ download: WKDownload) {
+        download.delegate = self
+        log("DOWNLOAD Datei \(download.originalRequest?.url?.absoluteString ?? "")")
+        show(L("Lädt …", "Downloading …"), symbol: "arrow.down.circle")
+    }
+
+    /// The page called `window.close()`. WebKit allows that only in windows a script opened.
+    func webViewDidClose(_ webView: WKWebView) {
+        log("POPUP schließt sich")
+        session.close(self)
+    }
+
+    // MARK: alert, confirm, prompt
+
+    func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo) async {
+        _ = await dialog(message, frame: frame, cancel: false)
+    }
+
+    func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo) async -> Bool {
+        await dialog(message, frame: frame, cancel: true) != nil
+    }
+
+    func webView(_ webView: WKWebView, runJavaScriptTextInputPanelWithPrompt prompt: String, defaultText: String?,
+                 initiatedByFrame frame: WKFrameInfo) async -> String? {
+        await dialog(prompt, frame: frame, cancel: true, field: defaultText ?? "")
+    }
+
+    /// The text field's content (or "") for OK, nil for Cancel or when no dialog may show.
+    private func dialog(_ message: String, frame: WKFrameInfo, cancel: Bool, field: String? = nil) async -> String? {
+        dialogs += 1
+        guard session.current === self, dialogs <= 5, var top = webView?.window?.rootViewController else {
+            log("BLOCKIERT Dialog: \(message.prefix(120))")
+            return nil
+        }
+        while let next = top.presentedViewController { top = next }
+        // A controller in the middle of a transition drops the alert: its handler never runs and the page hangs.
+        guard !top.isBeingPresented, !top.isBeingDismissed else {
+            log("BLOCKIERT Dialog (Ansicht wechselt): \(message.prefix(120))")
+            return nil
+        }
+        let host = frame.securityOrigin.host
+        let alert = UIAlertController(title: host.isEmpty ? nil : host, message: message, preferredStyle: .alert)
+        if let field { alert.addTextField { $0.text = field } }
+        return await withCheckedContinuation { done in
+            if cancel { alert.addAction(UIAlertAction(title: L("Abbrechen", "Cancel"), style: .cancel) { _ in done.resume(returning: nil) }) }
+            alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in done.resume(returning: alert.textFields?.first?.text ?? "") })
+            top.present(alert, animated: true)
+        }
+    }
+
+    /// Router and NAS logins (HTTP 401) ask for name and password; a certificate the user accepted after the
+    /// warning stays accepted for the host until the app quits. Everything else is WebKit's normal check.
+    func webView(_ webView: WKWebView, respondTo challenge: URLAuthenticationChallenge) async -> (URLSession.AuthChallengeDisposition, URLCredential?) {
+        let space = challenge.protectionSpace
+        switch space.authenticationMethod {
+        case NSURLAuthenticationMethodServerTrust:
+            if session.trustedHosts.contains(space.host), let trust = space.serverTrust {
+                log("ZERTIFIKAT trotz Fehler angenommen: \(space.host)")
+                return (.useCredential, URLCredential(trust: trust))
+            }
+        case NSURLAuthenticationMethodHTTPBasic, NSURLAuthenticationMethodHTTPDigest, NSURLAuthenticationMethodNTLM:
+            if challenge.previousFailureCount < 3, let (user, password) = await askLogin(space) {
+                return (.useCredential, URLCredential(user: user, password: password, persistence: isPrivate ? .none : .forSession))
+            }
+            return (.rejectProtectionSpace, nil)   // shows the server's own 401 page
+        default:
+            break
+        }
+        return (.performDefaultHandling, nil)
+    }
+
+    private func askLogin(_ space: URLProtectionSpace) async -> (String, String)? {
+        guard session.current === self, var top = webView?.window?.rootViewController else { return nil }
+        while let next = top.presentedViewController { top = next }
+        guard !top.isBeingPresented, !top.isBeingDismissed else { return nil }
+        let secure = space.receivesCredentialSecurely ? "" : L("\nDie Verbindung ist nicht verschlüsselt.", "\nThe connection is not encrypted.")
+        let alert = UIAlertController(title: L("Anmelden", "Sign in"),
+                                      message: space.host + (space.realm.map { " · " + $0 } ?? "") + secure, preferredStyle: .alert)
+        alert.addTextField { $0.placeholder = L("Benutzername", "Username"); $0.textContentType = .username }
+        alert.addTextField { $0.placeholder = L("Passwort", "Password"); $0.isSecureTextEntry = true; $0.textContentType = .password }
+        return await withCheckedContinuation { done in
+            alert.addAction(UIAlertAction(title: L("Abbrechen", "Cancel"), style: .cancel) { _ in done.resume(returning: nil) })
+            alert.addAction(UIAlertAction(title: L("Anmelden", "Sign in"), style: .default) { _ in
+                done.resume(returning: (alert.textFields?[0].text ?? "", alert.textFields?[1].text ?? ""))
+            })
+            top.present(alert, animated: true)
+        }
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
@@ -742,9 +1137,30 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate {
         let error = error as NSError
         log("LADEFEHLER \(error.domain) \(error.code)")
         // -999 and 102 are our own cancellations, already reported by the guard.
-        if error.code != NSURLErrorCancelled && !(error.domain == "WebKitErrorDomain" && error.code == 102) {
+        let certificateErrors = [NSURLErrorServerCertificateUntrusted, NSURLErrorServerCertificateHasBadDate,
+                                 NSURLErrorServerCertificateHasUnknownRoot, NSURLErrorServerCertificateNotYetValid]
+        if certificateErrors.contains(error.code), let url = error.userInfo[NSURLErrorFailingURLErrorKey] as? URL, let host = url.host {
+            // Chrome's "Your connection is not private": the way on is a deliberate step, for this host and this app run.
+            show(L("Verbindung nicht privat: ", "Connection not private: ") + host + " · " + error.localizedDescription,
+                 symbol: "exclamationmark.lock.fill", lasting: true,
+                 action: (L("Trotzdem öffnen", "Open anyway"), { [weak self] in
+                    self?.session.trustedHosts.insert(host)
+                    self?.open(url)
+                 }))
+        } else if [NSURLErrorCannotFindHost, NSURLErrorCannotConnectToHost].contains(error.code),
+           let url = error.userInfo[NSURLErrorFailingURLErrorKey] as? URL {
+            offerArchive(of: url, because: error.localizedDescription)
+        } else if error.code != NSURLErrorCancelled && !(error.domain == "WebKitErrorDomain" && error.code == 102) {
             show(error.localizedDescription, symbol: "exclamationmark.triangle.fill")
         }
+    }
+
+    /// A dead page may live on in the Internet Archive; the notice's button opens its latest copy there.
+    private func offerArchive(of url: URL, because reason: String? = nil) {
+        guard ["http", "https"].contains(url.scheme?.lowercased() ?? ""), url.host() != "web.archive.org",
+              let archived = URL(string: "https://web.archive.org/web/2/" + url.absoluteString) else { return }
+        show((reason.map { $0 + " " } ?? "") + L("Archiv-Version öffnen?", "Open an archived copy?"),
+             archived, symbol: "clock.arrow.circlepath", lasting: true)
     }
 
     // MARK: Context menu & new windows
@@ -752,9 +1168,20 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate {
     func webView(
         _ webView: WKWebView, contextMenuConfigurationFor elementInfo: WKContextMenuElementInfo
     ) async -> UIContextMenuConfiguration? {
+        let image = await pressedImage()
+        let saveImage = image.map { image in
+            UIAction(title: L("Bild laden", "Download image"), image: UIImage(systemName: "arrow.down.circle")) { [weak self] _ in
+                self?.download(image)
+            }
+        }
         guard let linkURL = elementInfo.linkURL,
               let scheme = linkURL.scheme?.lowercased(),
-              scheme == "http" || scheme == "https" else { return nil }
+              scheme == "http" || scheme == "https" else {
+            guard let saveImage else { return nil }
+            return UIContextMenuConfiguration(identifier: nil, previewProvider: nil) { suggested in
+                UIMenu(children: [UIMenu(options: .displayInline, children: [saveImage])] + suggested)
+            }
+        }
         return UIContextMenuConfiguration(identifier: nil, previewProvider: nil) { [weak self] suggested in
             let openNew = UIAction(
                 title: L("In neuem Tab öffnen", "Open in New Tab"),
@@ -764,7 +1191,7 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate {
                 title: L("Im Hintergrund öffnen", "Open in Background"),
                 image: UIImage(systemName: "plus.square.on.square")
             ) { _ in self?.session.openInNewTab(linkURL, inBackground: true) }
-            let tabGroup = UIMenu(options: .displayInline, children: [openNew, openBackground])
+            let tabGroup = UIMenu(options: .displayInline, children: [openNew, openBackground] + [saveImage].compactMap { $0 })
             return UIMenu(title: linkURL.host ?? "", children: [tabGroup] + suggested)
         }
     }
@@ -772,21 +1199,36 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate {
     /// Ad scripts that see `window.open` fail swallow every following tap and try again. So the page gets
     /// a window that does nothing and believes its popup opened; the real URL is reported to `popup`.
     /// Runs apart from the page's own scripts, so a page cannot see or undo it.
+    /// The address of the link under the pointer, for the Mac's status pill. Only where there is a pointer.
+    static let hoverScript = """
+        (() => {
+            if (!matchMedia('(hover: hover)').matches) return;
+            let shown = '';
+            const tell = href => {
+                if (href === shown) return;
+                shown = href;
+                try { webkit.messageHandlers.hover.postMessage(href); } catch (error) {}
+            };
+            addEventListener('mouseover', event => {
+                const link = event.target.closest && event.target.closest('a[href]');
+                tell(link ? link.href : '');
+            }, true);
+            document.addEventListener('mouseleave', () => tell(''));
+        })();
+        """
+
     static let mediaScript = """
         let playing = null, leftAt = 0, pausedAt = 0;
         const tell = text => { try { webkit.messageHandlers.media.postMessage(text); } catch (error) {} };
         // iOS pauses a video the moment the app leaves the screen. A pause that comes together with
         // leaving is that and not the user, so play on. A later pause from the lock screen stays.
-        // The app announces the leaving itself (ruheLeaving): "visibilitychange" often arrives only
-        // after iOS has frozen the page, which is too late.
+        // The app announces the leaving itself (ruheLeaving). Not "visibilitychange": that also fires when
+        // the user switches tabs, and then a pause they made just before would be undone.
         const resume = () => {
             if (!playing || !playing.paused || Math.abs(leftAt - pausedAt) > 2000) return;
             tell('beim Verlassen pausiert, spielt im Hintergrund weiter');
             playing.play().catch(error => tell('Weiterspielen abgelehnt: ' + error));
         };
-        document.addEventListener('visibilitychange', () => {
-            if (document.hidden) ruheLeaving();
-        }, true);
         addEventListener('pause', event => {
             if (event.composedPath()[0] !== playing) return;
             pausedAt = Date.now();
@@ -837,18 +1279,35 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate {
             }, 2500);
             tell('Bild-in-Bild angefordert');
             video.webkitSetPresentationMode('picture-in-picture');
+            setTimeout(watchMode, 1000);
         }
         /// The app's own button.
         function ruheToggleFloat() {
             if (playing && playing.webkitPresentationMode === 'picture-in-picture') ruheLand(); else ruheFloat(true);
         }
         // What iOS really did with the request: the log line above only says it was asked.
+        const shownModes = new WeakMap();
+        function presentationChanged(media) {
+            const mode = media.webkitPresentationMode;
+            if ((shownModes.get(media) ?? 'inline') === mode) return;
+            shownModes.set(media, mode);
+            tell('Darstellung jetzt: ' + mode);
+            // Native full screen also takes only the video along, so it needs the native track too.
+            if (media === playing) ruheSubtitles(mode !== 'inline');
+        }
         addEventListener('webkitpresentationmodechanged', event => {
             const media = event.composedPath()[0];
-            if (!(media instanceof HTMLVideoElement)) return;
-            tell('Darstellung jetzt: ' + media.webkitPresentationMode);
-            if (media === playing) ruheSubtitles(media.webkitPresentationMode === 'picture-in-picture');
+            if (media instanceof HTMLVideoElement) presentationChanged(media);
         }, true);
+        // The page script stops that event for the page; when its listener came first, ours never hears it.
+        // Polled only while a video plays or floats, so idle tabs keep no timer.
+        let modeTimer = 0;
+        const watchMode = () => {
+            const on = playing instanceof HTMLVideoElement && (!playing.paused || playing.webkitPresentationMode !== 'inline');
+            if (on && !modeTimer) modeTimer = setInterval(() => { if (playing) presentationChanged(playing); watchMode(); }, 500);
+            if (!on && modeTimer) { clearInterval(modeTimer); modeTimer = 0; }
+        };
+        for (const type of ['play', 'pause', 'emptied', 'webkitpresentationmodechanged']) addEventListener(type, () => setTimeout(watchMode), true);
 
         // Subtitles in picture-in-picture. Players draw subtitles as page elements or ASS canvases over the video,
         // and the floating window takes only the video along. Convert WebVTT, SRT or ASS/SSA subtitle files into a
@@ -923,7 +1382,8 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate {
         function pageSubtitle(video) {
             const tracks = [...video.textTracks].filter(track => track !== prepared?.element?.track
                 && /^(subtitles|captions)$/.test(track.kind));
-            return tracks.find(track => track.mode === 'showing')
+            // Only a track with lines counts: kaa.lt's player leaves an empty "captions" track showing.
+            return tracks.find(track => track.mode === 'showing' && track.cues?.length)
                 ?? tracks.find(track => track.mode === 'hidden' && track.cues?.length);
         }
         function preloadSubtitles(video) {
@@ -1038,6 +1498,7 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate {
             // YouTube throws a video back out of picture-in-picture when it hears about the change.
             addEventListener('webkitpresentationmodechanged', event => event.stopImmediatePropagation(), true);
 
+            const allowPopups = false;   // true on sites where the user allowed popups (Session.pageScripts)
             const decoy = new Proxy(function () {}, {
                 get: (_, key) => key === 'closed' ? false : key === Symbol.toPrimitive ? () => '' : decoy,
                 set: () => true,
@@ -1045,7 +1506,7 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate {
                 construct: () => decoy,
             });
             let tapped = null, tappedAt = 0;
-            window.open = function (url) {
+            if (!allowPopups) window.open = function (url) {
                 try {
                     webkit.messageHandlers.popup.postMessage(new URL(url || 'about:blank', location.href).href);
                     // An empty layer over the page that answers a tap with a popup is an ad trap (kaa.to puts
@@ -1099,6 +1560,26 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate {
             log("VIDEO \(body)")
         } else if message.name == "tap" {
             log("TIPP \(body)")
+        } else if message.name == "hover" {
+            hoverLink = body
+        } else if message.name == "password" {
+            passwordSubmitted(body, frame: message.frameInfo)
+        } else if message.name == "devConsole" {
+            guard capturesConsole else { return }
+            let data = (try? JSONSerialization.jsonObject(with: Data(body.utf8))) as? [String: String] ?? [:]
+            addDevEntry(DevEntry(level: data["level"] ?? "log", text: data["text"] ?? body))
+        } else if message.name == "download" {
+            mediaPressed(body)
+        } else if message.name == "privacy" {
+            let (kind, text) = body.firstIndex(of: "\n").map { (body[..<$0], String(body[body.index(after: $0)...])) } ?? (body[...], "")
+            log("PRIVATSPHÄRE \(kind) \(kind == "clipboard" ? "" : text)")
+            guard session.current === self else { return }
+            if kind == "clipboard" {
+                show(L("Seite hat den kopierten Text verändert", "Page changed the copied text"), symbol: "doc.on.clipboard",
+                     action: (L("Original kopieren", "Copy original"), { UIPasteboard.general.string = text }))
+            } else if kind == "cookies", let site = Self.site(committed), session.cookieSites.insert(site).inserted {
+                show(L("Cookie-Banner abgelehnt", "Cookie banner rejected"), symbol: "checkmark.shield")
+            }
         } else {
             log("BLOCKIERT window.open aus \(message.frameInfo.request.url?.absoluteString ?? "?"): \(body)")
             popupBlocked(URL(string: body))
@@ -1117,9 +1598,14 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate {
         _ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
         for action: WKNavigationAction, windowFeatures: WKWindowFeatures
     ) -> WKWebView? {
-        // Never a second window. A tapped link that asks for a new tab inside the same site opens here.
+        // Never a second window, unless the user allowed popups on this site: then it becomes a tab of its own.
+        // WebKit lets only a tap open one (javaScriptCanOpenWindowsAutomatically is off).
         let url = action.request.url
         let type = Self.typeNames[action.navigationType] ?? "?"
+        if popupsAllowed(on: committed) {
+            log("ERLAUBT Popup (\(type)): \(url?.absoluteString ?? "")")
+            return session.openPopup(from: self, with: configuration)
+        }
         if let url, url.host != nil, action.navigationType == .linkActivated, Self.site(url) == Self.site(committed) {
             log("ERLAUBT neues Fenster hier geöffnet (\(type)): \(url.absoluteString)")
             open(url)
@@ -1128,5 +1614,45 @@ final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate {
             popupBlocked(url)
         }
         return nil
+    }
+}
+
+/// What a web extension sees of a tab. A sleeping tab has no web view until it is woken.
+extension Browser: WKWebExtensionTab {
+    func window(for context: WKWebExtensionContext) -> (any WKWebExtensionWindow)? { session }
+    func indexInWindow(for context: WKWebExtensionContext) -> Int { session.tabs.firstIndex { $0 === self } ?? NSNotFound }
+    func webView(for context: WKWebExtensionContext) -> WKWebView? { webView }
+    func title(for context: WKWebExtensionContext) -> String? { title }
+    func url(for context: WKWebExtensionContext) -> URL? { address }
+    func isLoadingComplete(for context: WKWebExtensionContext) -> Bool { !isLoading }
+    func isPlayingAudio(for context: WKWebExtensionContext) -> Bool { isPlaying }
+    func isSelected(for context: WKWebExtensionContext) -> Bool { session.current === self }
+
+    func loadURL(_ url: URL, for context: WKWebExtensionContext) async throws {
+        if webView == nil { deferred = url } else { open(url) }
+    }
+    func reload(fromOrigin: Bool, for context: WKWebExtensionContext) async throws { reload() }
+    func goBack(for context: WKWebExtensionContext) async throws { webView?.goBack() }
+    func goForward(for context: WKWebExtensionContext) async throws { webView?.goForward() }
+    func activate(for context: WKWebExtensionContext) async throws { session.select(self) }
+    func close(for context: WKWebExtensionContext) async throws { session.close(self) }
+}
+
+/// Where typed text that is not an address goes. Chosen in the settings menu, DuckDuckGo until then.
+struct SearchEngine: Hashable, Sendable {
+    let name: String
+    let base: String
+    let parameter: String
+
+    static let all = [
+        SearchEngine(name: "DuckDuckGo", base: "https://duckduckgo.com/", parameter: "q"),
+        SearchEngine(name: "Google", base: "https://www.google.com/search", parameter: "q"),
+        SearchEngine(name: "Brave Search", base: "https://search.brave.com/search", parameter: "q"),
+        SearchEngine(name: "Startpage", base: "https://www.startpage.com/sp/search", parameter: "query"),
+        SearchEngine(name: "Ecosia", base: "https://www.ecosia.org/search", parameter: "q"),
+        SearchEngine(name: "Bing", base: "https://www.bing.com/search", parameter: "q"),
+    ]
+    static var current: SearchEngine {
+        all.first { $0.name == UserDefaults.standard.string(forKey: "searchEngine") } ?? all[0]
     }
 }

@@ -8,11 +8,31 @@
     <color name="accent">#81DAC6</color>
     <color name="on_accent">#092B23</color>
     <color name="danger">#FFB4AB</color>
+    <color name="warn">#FFB870</color>
+    <color name="private_ink">#D3BBF7</color>
+    <color name="private_field">#3A2D4D</color>
 
     <style name="Theme.PouBrowser" parent="android:style/Theme.Material.NoActionBar">
         <item name="android:windowBackground">@color/surface</item>
         <item name="android:colorAccent">@color/accent</item>
         <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:alertDialogTheme">@style/Theme.PouBrowser.Dialog</item>
+        <item name="android:popupMenuStyle">@style/PouBrowser.PopupMenu</item>
+    </style>
+
+    <!-- Dialogs and menus as rounded cards with sentence-case buttons, like the iOS app and current Android apps. -->
+    <style name="Theme.PouBrowser.Dialog" parent="android:style/Theme.Material.Dialog.Alert">
+        <item name="android:colorAccent">@color/accent</item>
+        <item name="android:windowBackground">@drawable/dialog_background</item>
+        <item name="android:buttonBarButtonStyle">@style/PouBrowser.DialogButton</item>
+    </style>
+    <style name="PouBrowser.DialogButton" parent="android:style/Widget.Material.Button.Borderless.Colored">
+        <item name="android:textAllCaps">false</item>
+        <item name="android:textSize">15sp</item>
+    </style>
+    <style name="PouBrowser.PopupMenu" parent="android:style/Widget.Material.PopupMenu">
+        <item name="android:popupBackground">@drawable/menu_background</item>
+        <item name="android:popupElevation">8dp</item>
     </style>
 </resources>

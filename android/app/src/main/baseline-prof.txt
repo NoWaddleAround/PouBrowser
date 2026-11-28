@@ -1,0 +1,4 @@
+# Compiled ahead of time on install from the Play Store: the ad blocker and the browser code run on every
+# page start, and the whole app is small enough to compile in full.
+HSPLcom/nowaddlearound/poubrowser/**;->**(**)**
+Lcom/nowaddlearound/poubrowser/**;

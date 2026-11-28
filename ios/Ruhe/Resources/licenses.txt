@@ -1,0 +1,82 @@
+PouBrowser
+Copyright (C) 2026 NoWaddleAround
+
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+Source code: https://github.com/NoWaddleAround/PouBrowser
+GNU General Public License 3.0: https://www.gnu.org/licenses/gpl-3.0.html
+
+
+BUILT-IN COMPONENTS
+
+AdGuard Scriptlets 2.3.1 (iOS, Mac, Android)
+Copyright (C) AdGuard
+GPL-3.0 · https://github.com/AdguardTeam/Scriptlets
+
+AdGuard ExtendedCss 2.1.1 (iOS, Mac, Android)
+Copyright (c) 2024 AdGuard
+GPL-3.0 · https://github.com/AdguardTeam/ExtendedCss
+
+AdGuard SafariConverterLib (iOS, Mac)
+Copyright (C) AdGuard
+GPL-3.0 · https://github.com/AdguardTeam/SafariConverterLib
+
+Dark Reader 4.9.135 (iOS, Mac, Android)
+Copyright (c) 2026 Dark Reader Ltd.
+MIT License · https://github.com/darkreader/darkreader
+
+swift-psl (iOS, Mac)
+Copyright 2025 Andrey Meshkov
+MIT License · https://github.com/ameshkov/swift-psl
+
+PunycodeSwift (iOS, Mac)
+Copyright (c) 2018 Gumob
+MIT License · https://github.com/gumob/PunycodeSwift
+
+Public Suffix List (iOS, Mac, inside swift-psl)
+Mozilla Public License 2.0 · https://publicsuffix.org · https://mozilla.org/MPL/2.0/
+
+DuckDuckGo autoconsent 18.12.0 (cookie banner opt-out; start-up part changed by Scripts/autoconsent.py)
+Copyright (c) DuckDuckGo, Inc.
+Mozilla Public License 2.0 · https://github.com/duckduckgo/autoconsent · https://mozilla.org/MPL/2.0/
+
+OkHttp 4.12.0 (Android)
+Copyright 2019 Square, Inc.
+Apache License 2.0 · https://github.com/square/okhttp
+
+AndroidX Core and AndroidX WebKit (Android)
+Copyright The Android Open Source Project
+Apache License 2.0 · https://developer.android.com/jetpack/androidx
+
+Kotlin standard library (Android)
+Copyright JetBrains s.r.o. and Kotlin Programming Language contributors
+Apache License 2.0 · https://github.com/JetBrains/kotlin
+
+Mozilla Readability 0.6.0 (iOS, Mac, Android)
+Copyright (c) 2010 Arc90 Inc
+Apache License 2.0 · https://github.com/mozilla/readability
+
+Apache License 2.0: https://www.apache.org/licenses/LICENSE-2.0
+
+
+FILTER LISTS (downloaded by the app, not bundled)
+
+EasyPrivacy, by The EasyList authors (https://easylist.to)
+GPL-3.0 or later, or CC BY-SA 3.0 or later · used under GPL-3.0
+
+AdGuard Base, Mobile Ads, Popups and Cookie Notices filters, by AdGuard
+GPL-3.0 · https://github.com/AdguardTeam/AdguardFilters
+
+uBlock filters, badware, privacy, quick fixes and unbreak lists, by Raymond Hill and the uAssets contributors
+GPL-3.0 · https://github.com/uBlockOrigin/uAssets
+
+
+MIT License (applies to Dark Reader, swift-psl and PunycodeSwift, with their copyright lines above)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

@@ -1,4 +1,8 @@
 build/
 xcuserdata/
 .DS_Store
-Docs/
+# Research notes and screenshots stay local; the Windows guide is shared.
+Docs/*
+!Docs/Windows.md
+build-mac/
+build-device/

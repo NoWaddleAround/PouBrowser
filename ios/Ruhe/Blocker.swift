@@ -1,20 +1,14 @@
 import ContentBlockerConverter
-import CryptoKit
+import FilterEngine
 import WebKit
-
-struct FilterList: Sendable {
-    let name: String
-    /// Several addresses become one list: an exception rule only undoes blocks inside its own list.
-    let addresses: [String]
-    /// How long a compiled copy counts as fresh.
-    let days: Double
-}
 
 /// Ad and tracker blocking. Downloads open filter lists, converts them with AdGuard's converter and
 /// hands them to WebKit, which drops matching requests before they load. WebKit takes at most
 /// 150,000 rules per list, so each entry stays its own list.
 @MainActor @Observable
 final class Blocker {
+    static let shared = Blocker()
+
     /// `-testFilterList <address>` as a launch argument adds a list of one's own (see Scripts/popup-test).
     static let lists = builtIn + (UserDefaults.standard.string(forKey: "testFilterList").map {
         [FilterList(name: "test", addresses: [$0], days: 0)]
@@ -27,6 +21,8 @@ final class Blocker {
         FilterList(name: "easyprivacy", addresses: ["https://easylist.to/easylist/easyprivacy.txt"], days: 3),
         // Popunders, fake notifications, "open in app" banners.
         FilterList(name: "adguard-popups", addresses: ["https://filters.adtidy.org/ios/filters/19.txt"], days: 3),
+        // Cookie consent banners, hidden or answered with "reject".
+        FilterList(name: "adguard-cookies", addresses: ["https://filters.adtidy.org/ios/filters/18.txt"], days: 3),
         // uBlock Origin's own lists, strong on streaming and manga sites. "Quick fixes" changes several
         // times a day, hence the daily refresh.
         FilterList(name: "ublock", addresses: [
@@ -42,17 +38,37 @@ final class Blocker {
     let pageRules = PageRules()
     /// Every tab's controller, so a list compiled later also reaches pages that are already open.
     @ObservationIgnored private let controllers = NSHashTable<WKUserContentController>.weakObjects()
-    @ObservationIgnored private var compiled = [WKContentRuleList]()
+    @ObservationIgnored private var compiled = [String: WKContentRuleList]()
+    /// The user's block list ("Seite sperren"): stays on also where the ad blocker is switched off.
+    @ObservationIgnored private var userList: WKContentRuleList?
     @ObservationIgnored private let paused = NSHashTable<WKUserContentController>.weakObjects()
     private(set) var status = L("Werbeblocker startet …", "Ad blocker starting …")
     private(set) var isUpdating = false
     /// Opens once the already-compiled lists from the store are attached, so cold-restored tabs do not load unfiltered.
     @ObservationIgnored private(set) var isReady = false
     @ObservationIgnored private var readyWaiters = [CheckedContinuation<Void, Never>]()
-    /// Where per-list results go (the app's log).
-    @ObservationIgnored var report: (String) -> Void = { _ in }
+    @ObservationIgnored private let sessions = NSHashTable<Session>.weakObjects()
+    private(set) var blockedSites = Set(UserDefaults.standard.stringArray(forKey: "blockedSites") ?? [])
+
+    func register(_ session: Session) { sessions.add(session) }
+
+    private func report(_ entry: String) { sessions.anyObject?.log(entry) }
+
+    func setBlocked(_ blocked: Bool, site: String) {
+        if blocked { blockedSites.insert(site) } else { blockedSites.remove(site) }
+        UserDefaults.standard.set(Array(blockedSites), forKey: "blockedSites")
+        Task { await applyBlockedSites() }
+    }
+
+    func replaceBlocked(_ sites: Set<String>) {
+        blockedSites = sites
+        UserDefaults.standard.set(Array(blockedSites), forKey: "blockedSites")
+        Task { await applyBlockedSites() }
+    }
+
     private let store = WKContentRuleListStore.default()!
-    @ObservationIgnored private var attached = Set<String>()
+    @ObservationIgnored private var installed = InstalledFilters()
+    @ObservationIgnored private var starting = false
 
     func waitUntilReady() async {
         guard !isReady else { return }
@@ -61,201 +77,193 @@ final class Blocker {
 
     /// Gives a new tab's controller the compiled lists and keeps it up to date.
     func attach(to controller: WKUserContentController) {
-        compiled.forEach(controller.add)
+        if !Session.off("noLists") { Self.lists.compactMap { compiled[$0.name] }.forEach(controller.add) }
+        userList.map(controller.add)
         controllers.add(controller)
+    }
+
+    /// Compiles the blocked sites into one rule list that stops every request to them and their subdomains.
+    private func applyBlockedSites() async {
+        let sites = blockedSites
+        var list: WKContentRuleList?
+        if !sites.isEmpty {
+            let rules = sites.sorted().map { site -> [String: Any] in
+                let escaped = NSRegularExpression.escapedPattern(for: site)
+                return ["trigger": ["url-filter": "^[a-z]+://([^/:]*\\.)?" + escaped + "[/:]"], "action": ["type": "block"]]
+            }
+            if let data = try? JSONSerialization.data(withJSONObject: rules), let json = String(data: data, encoding: .utf8) {
+                do { list = try await store.compileContentRuleList(forIdentifier: "user-blocked", encodedContentRuleList: json) }
+                catch { report("FILTER user-blocked: \(error.localizedDescription)"); return }
+            }
+        }
+        guard sites == blockedSites else { return }
+        for controller in controllers.allObjects {
+            userList.map(controller.remove)
+            list.map(controller.add)
+        }
+        userList = list
     }
 
     /// Takes the lists off one tab, for a site whose ad blocker the user switched off, or puts them back.
     func setLists(on controller: WKUserContentController, enabled: Bool) {
         guard enabled == paused.contains(controller) else { return }
         controller.removeAllContentRuleLists()
+        userList.map(controller.add)
         if enabled {
             paused.remove(controller)
-            compiled.forEach(controller.add)
+            if !Session.off("noLists") { Self.lists.compactMap { compiled[$0.name] }.forEach(controller.add) }
         } else {
             paused.add(controller)
         }
     }
 
     func start() async {
-        await attach()
+        guard !starting, !isReady else { return }
+        starting = true
+        if let data = try? Data(contentsOf: InstalledFilters.manifest),
+           let saved = try? JSONDecoder().decode(InstalledFilters.self, from: data) {
+            installed = saved
+        }
+
+        let folder = installed.engineFolder
+        async let engine = Task.detached(priority: .utility) { try? PageRules.open(folder) }.value
+        await withTaskGroup(of: (String, WKContentRuleList?).self) { group in
+            for list in Self.lists {
+                let identifier = installed.lists[list.name].map { InstalledFilters.identifier(list.name, $0.slot) } ?? list.name
+                group.addTask { @MainActor [store] in
+                    (list.name, try? await store.contentRuleList(forIdentifier: identifier))
+                }
+            }
+            for await (name, object) in group {
+                if let object { replace(name, with: object) }
+            }
+        }
+        await applyBlockedSites()
+        pageRules.engine = await engine
+        isReady = true
+        readyWaiters.forEach { $0.resume() }
+        readyWaiters.removeAll()
+        refreshStatus()
         await update(all: false)
     }
 
-    /// `all: false` refreshes only lists that are missing or older than their interval.
+    private func replace(_ name: String, with object: WKContentRuleList) {
+        let old = compiled.updateValue(object, forKey: name)
+        guard !Session.off("noLists") else { return }
+        for controller in controllers.allObjects where !paused.contains(controller) {
+            old.map(controller.remove)
+            controller.add(object)
+        }
+    }
+
+    private func refreshStatus() {
+        let count = compiled.keys.reduce(0) { total, name in
+            total + (installed.lists[name]?.count ?? UserDefaults.standard.integer(forKey: "rules." + name))
+        }
+        status = compiled.isEmpty || Session.off("noLists")
+            ? L("Werbeblocker aus: keine Filterliste geladen", "Ad blocker off: no filter list loaded")
+            : L("Werbeblocker aktiv · \(count.formatted()) Regeln", "Ad blocker active · \(count.formatted()) rules")
+    }
+
+    private struct Prepared {
+        let list: InstalledFilters.List
+        let object: WKContentRuleList
+    }
+
+    /// A maximum of two lists can own converter output while WebKit compiles it.
+    private func prepare(_ list: FilterList) async throws -> Prepared? {
+        let active = installed.lists[list.name]
+        let reusable = compiled[list.name] != nil && list.days > 0 &&
+            FileManager.default.fileExists(atPath: installed.advanced(list.name).path)
+        guard let staged = try await FilterSources.stage(list, installed: active, reuse: reusable) else { return nil }
+        let slot = !(active?.slot ?? true)
+        let converted = try await Task.detached(priority: .utility) {
+            var combined = Data()
+            for i in list.addresses.indices {
+                try combined.append(Data(contentsOf: staged.directory.appending(path: "\(i).txt"), options: .mappedIfSafe))
+                combined.append(0x0A)
+            }
+            let converted = Self.convert(combined)
+            try converted.pageRules.write(to: staged.directory.appending(path: "advanced.txt"), atomically: true, encoding: .utf8)
+            return (converted.json, converted.count)
+        }.value
+        let id = InstalledFilters.identifier(list.name, slot)
+        guard let object = try await store.compileContentRuleList(forIdentifier: id, encodedContentRuleList: converted.0) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        return Prepared(list: .init(slot: slot, count: converted.1, parts: staged.parts), object: object)
+    }
+
+    /// A manual refresh also validates fresh lists. Validators always describe the published slot.
     func update(all: Bool = true) async {
+        if !isReady {
+            if !starting { await start() } else { await waitUntilReady() }
+        }
         guard !isUpdating else { return }
         let defaults = UserDefaults.standard
         let now = Date.now.timeIntervalSince1970
-        let due = Self.lists.filter {
-            all || !attached.contains($0.name) || !FileManager.default.fileExists(atPath: PageRules.file(for: $0.name).path)
-                || now - defaults.double(forKey: "updated." + $0.name) > $0.days * 86_400
+        let due = Self.lists.filter { list in
+            all || !installed.hasParts(for: list) || compiled[list.name] == nil ||
+                !FileManager.default.fileExists(atPath: installed.advanced(list.name).path) ||
+                now - defaults.double(forKey: "updated." + list.name) >= list.days * 86_400
         }
-        guard !due.isEmpty else { return }
+        guard !due.isEmpty || pageRules.engine == nil else { return }
         isUpdating = true
         defer { isUpdating = false }
-        status = L("Filterlisten werden geladen …", "Loading filter lists …")   // the lists compiled last time keep blocking meanwhile
-
-        let previouslyAttached = attached
-        struct FetchOutcome: Sendable {
-            let list: FilterList
-            let result: Result<(changed: Bool, converted: (json: String, count: Int, pageRules: String)?), Error>
+        status = L("Filterlisten werden geladen …", "Loading filter lists …")
+        for list in due { defaults.removeObject(forKey: "updated." + list.name) }
+        var changed = [String: Prepared]()
+        var failed = [String]()
+        await withTaskGroup(of: (String, Result<Prepared?, Error>).self) { group in
+            var pending = due.makeIterator()
+            func enqueue(_ list: FilterList) {
+                group.addTask { @MainActor in
+                    do { return (list.name, .success(try await self.prepare(list))) }
+                    catch { return (list.name, .failure(error)) }
+                }
+            }
+            for _ in 0..<2 { if let list = pending.next() { enqueue(list) } }
+            while let (name, result) = await group.next() {
+                switch result {
+                case .success(.some(let part)): changed[name] = part
+                case .success(nil): defaults.set(now, forKey: "updated." + name)
+                case .failure(let error):
+                    failed.append(name)
+                    report("FILTER \(name): \(error.localizedDescription)")
+                }
+                if let list = pending.next() { enqueue(list) }
+            }
         }
-        let outcomes = await withTaskGroup(of: FetchOutcome.self) { group in
-            for list in due {
-                let canReuse = previouslyAttached.contains(list.name)
-                    && FileManager.default.fileExists(atPath: PageRules.file(for: list.name).path)
-                    && list.days > 0
-                group.addTask {
-                    do {
-                        let fetched = try await Self.fetchAndConvert(list: list, allowNotModified: canReuse)
-                        return FetchOutcome(list: list, result: .success(fetched))
-                    } catch {
-                        return FetchOutcome(list: list, result: .failure(error))
+        if !changed.isEmpty || pageRules.engine == nil {
+            do {
+                var next = installed
+                for (name, prepared) in changed { next.lists[name] = prepared.list }
+                next.engineSlot = !(installed.engineSlot ?? true)
+                let files = Self.lists.compactMap { list -> URL? in
+                    guard next.lists[list.name] != nil || compiled[list.name] != nil else { return nil }
+                    return next.advanced(list.name)
+                }
+                if !files.isEmpty {
+                    let folder = next.engineFolder
+                    let engine = try await Task.detached(priority: .utility) { try PageRules.build(files, in: folder) }.value
+                    // The manifest selects the matching source bodies, validators, WebKit objects and page engine together.
+                    try JSONEncoder().encode(next).write(to: InstalledFilters.manifest, options: .atomic)
+                    installed = next
+                    pageRules.engine = engine
+                    for (name, prepared) in changed {
+                        replace(name, with: prepared.object)
+                        defaults.set(now, forKey: "updated." + name)
+                        report("FILTER \(name): \(prepared.list.count) Regeln")
                     }
                 }
-            }
-            var collected = [FetchOutcome]()
-            for await item in group { collected.append(item) }
-            return collected
-        }
-
-        var failed = [String]()
-        var rebuiltAny = false
-        for outcome in outcomes {
-            let list = outcome.list
-            switch outcome.result {
-            case .success(let (changed, converted)):
-                if !changed {
-                    defaults.set(now, forKey: "updated." + list.name)
-                    report("FILTER \(list.name): unverändert (304)")
-                    continue
-                }
-                guard let converted else { continue }
-                do {
-                    _ = try await store.compileContentRuleList(forIdentifier: list.name, encodedContentRuleList: converted.json)
-                    try FileManager.default.createDirectory(at: PageRules.folder, withIntermediateDirectories: true)
-                    try converted.pageRules.write(to: PageRules.file(for: list.name), atomically: true, encoding: .utf8)
-                    defaults.set(converted.count, forKey: "rules." + list.name)
-                    defaults.set(now, forKey: "updated." + list.name)
-                    rebuiltAny = true
-                    report("FILTER \(list.name): \(converted.count) Regeln")
-                } catch {
-                    report("FILTER \(list.name) fehlgeschlagen: \(error.localizedDescription)")
-                    failed.append(list.name)
-                }
-            case .failure(let error):
-                report("FILTER \(list.name) fehlgeschlagen: \(error.localizedDescription)")
-                failed.append(list.name)   // the list compiled last time stays in the store
-            }
-        }
-
-        if rebuiltAny || !pageRules.hasEngine {
-            do {
-                let names = Self.lists.map(\.name)
-                let count = try await Task.detached(priority: .utility) { try PageRules.rebuild(lists: names) }.value
-                pageRules.reloadEngine()
-                report("FILTER Skript-Regeln: \(count)")
             } catch {
-                report("FILTER Skript-Regeln fehlgeschlagen: \(error.localizedDescription)")
+                failed.append(contentsOf: changed.keys)
+                failed.append(L("Skript-Regeln", "page rules"))
+                report("FILTER: \(error.localizedDescription)")
             }
         }
-        await attach()
-        if !failed.isEmpty { status += L(" · Aktualisierung fehlgeschlagen: ", " · Update failed: ") + failed.joined(separator: ", ") }
-    }
-
-    private func attach() async {
-        let items = Self.lists
-        let lookedUp = await withTaskGroup(of: (Int, WKContentRuleList?).self) { group in
-            for (index, list) in items.enumerated() {
-                group.addTask { @MainActor [store] in
-                    (index, try? await store.contentRuleList(forIdentifier: list.name))
-                }
-            }
-            var pairs = Array<WKContentRuleList?>(repeating: nil, count: items.count)
-            for await (index, ruleList) in group { pairs[index] = ruleList }
-            return pairs
-        }
-
-        compiled = []
-        var rules = 0
-        attached = []
-        for (index, list) in items.enumerated() {
-            guard let ruleList = lookedUp[index] else { continue }
-            compiled.append(ruleList)
-            attached.insert(list.name)
-            rules += UserDefaults.standard.integer(forKey: "rules." + list.name)
-        }
-        if Session.off("noLists") { compiled = [] }
-        for controller in controllers.allObjects where !paused.contains(controller) {
-            controller.removeAllContentRuleLists()
-            compiled.forEach(controller.add)
-        }
-        status = compiled.isEmpty
-            ? L("Werbeblocker aus: keine Filterliste geladen", "Ad blocker off: no filter list loaded")
-            : L("Werbeblocker aktiv · \(rules.formatted()) Regeln", "Ad blocker active · \(rules.formatted()) rules")
-
-        if !isReady {
-            isReady = true
-            let waiters = readyWaiters
-            readyWaiters.removeAll()
-            waiters.forEach { $0.resume() }
-        }
-    }
-
-    nonisolated private static let rawFolder = PageRules.folder.appending(path: "raw")
-
-    nonisolated private static func rawFile(for address: String) -> URL {
-        let digest = SHA256.hash(data: Data(address.utf8)).map { String(format: "%02x", $0) }.joined()
-        return rawFolder.appending(path: digest + ".txt")
-    }
-
-    /// Downloads every part of `list`, honoring HTTP 304 conditional caching when `allowNotModified` is true,
-    /// and converts the combined rules off the main thread only when at least one part changed.
-    nonisolated private static func fetchAndConvert(
-        list: FilterList, allowNotModified: Bool
-    ) async throws -> (changed: Bool, converted: (json: String, count: Int, pageRules: String)?) {
-        let defaults = UserDefaults.standard
-        try FileManager.default.createDirectory(at: rawFolder, withIntermediateDirectories: true)
-        var combined = Data()
-        var anyChanged = !allowNotModified
-
-        for address in list.addresses {
-            guard let url = URL(string: address) else { throw URLError(.badURL) }
-            let cachedURL = rawFile(for: address)
-            let hasCached = FileManager.default.fileExists(atPath: cachedURL.path)
-            var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 40)
-            if allowNotModified, hasCached {
-                if let etag = defaults.string(forKey: "etag." + address) {
-                    request.setValue(etag, forHTTPHeaderField: "If-None-Match")
-                }
-                if let modified = defaults.string(forKey: "lastmod." + address) {
-                    request.setValue(modified, forHTTPHeaderField: "If-Modified-Since")
-                }
-            }
-            let (part, response) = try await URLSession.shared.data(for: request)
-            let http = response as? HTTPURLResponse
-            if http?.statusCode == 304, hasCached, let cachedData = try? Data(contentsOf: cachedURL) {
-                combined.append(cachedData)
-                combined.append(0x0A)
-                continue
-            }
-            guard http?.statusCode == 200 else { throw URLError(.badServerResponse) }
-            anyChanged = true
-            try? part.write(to: cachedURL, options: .atomic)
-            if let etag = http?.value(forHTTPHeaderField: "ETag") {
-                defaults.set(etag, forKey: "etag." + address)
-            }
-            if let modified = http?.value(forHTTPHeaderField: "Last-Modified") {
-                defaults.set(modified, forKey: "lastmod." + address)
-            }
-            combined.append(part)
-            combined.append(0x0A)
-        }
-
-        guard anyChanged else { return (false, nil) }
-        let converted = await Task.detached(priority: .utility) { convert(combined) }.value
-        return (true, converted)
+        refreshStatus()
+        if !failed.isEmpty { status += L(" · Aktualisierung fehlgeschlagen: ", " · Update failed: ") + failed.sorted().joined(separator: ", ") }
     }
 
     nonisolated private static func convert(_ data: Data) -> (json: String, count: Int, pageRules: String) {

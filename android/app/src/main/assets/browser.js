@@ -53,8 +53,11 @@
         construct: () => decoy,
     });
     const open = window.open;
+    // Set by the app before this script, only on sites where the user allowed popups.
+    const allowPopups = window.__pouPopups === true;
+    try { delete window.__pouPopups; } catch (_) {}
     const kaa = /(^|\.)(kaa\.to|kaa\.lt|kaa\.mx|krussdomi\.com)$/i.test(location.hostname);
-    window.open = function (url) {
+    if (!allowPopups) window.open = function (url) {
         if (tapped?.isConnected && Date.now() - tappedAt < 1000 &&
             !tapped.closest('a, button, input, select, textarea, label, video') && !tapped.innerText.trim() &&
             /^(fixed|absolute)$/.test(getComputedStyle(tapped).position)) {

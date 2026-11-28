@@ -2,6 +2,37 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>NSFaceIDUsageDescription</key>
+	<string>Gespeicherte Passwörter einsetzen und anzeigen. / Fill and show saved passwords.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Fotos und Videos für Uploads und Videoanrufe auf Webseiten. / Photos and videos for uploads and video calls on websites.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Webseiten deinen Standort geben, wenn du es erlaubst (Karten, Wetter). / Give websites your location when you allow it (maps, weather).</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>Web</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>http</string>
+				<string>https</string>
+			</array>
+		</dict>
+	</array>
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<false/>
+	</dict>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Ton für Videos und Anrufe auf Webseiten. / Sound for videos and calls on websites.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>Geladene Bilder und Videos in Fotos sichern. / Save downloaded images and videos to Photos.</string>
 	<key>CFBundleLocalizations</key>
 	<array>
 		<string>en</string>

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Rounded dialog card (Material 3 corner size), with room around it on the screen. -->
+<inset xmlns:android="http://schemas.android.com/apk/res/android"
+    android:insetLeft="20dp" android:insetRight="20dp" android:insetTop="24dp" android:insetBottom="24dp">
+    <shape android:shape="rectangle">
+        <corners android:radius="28dp" />
+        <solid android:color="@color/panel" />
+    </shape>
+</inset>

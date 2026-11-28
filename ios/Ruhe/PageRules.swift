@@ -20,17 +20,15 @@ final class PageRules {
         let summary: String
     }
 
-    nonisolated static let folder = URL.applicationSupportDirectory.appending(path: "PageRules")
+    var engine: WebExtension?
 
-    /// Where one list's rules are kept between updates.
-    nonisolated static func file(for list: String) -> URL { folder.appending(path: list + ".txt") }
-
-    private var engine = try? WebExtension(containerURL: folder)
-
-    var hasEngine: Bool { engine != nil }
-
-    func reloadEngine() {
-        engine = try? WebExtension(containerURL: Self.folder)
+    nonisolated static func open(_ folder: URL) throws -> WebExtension {
+        let engine = try WebExtension(containerURL: folder)
+        // Initialization only creates the directory. A lookup verifies the persisted index is readable.
+        guard engine.lookup(pageUrl: URL(string: "https://example.invalid/")!, topUrl: nil) != nil else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        return engine
     }
 
     /// AdGuard's scriptlets as function source, under every name the lists use (uBlock's "ubo-…" included).
@@ -64,11 +62,10 @@ final class PageRules {
         return WKUserScript(source: source, injectionTime: .atDocumentStart, forMainFrameOnly: false, in: .defaultClient)
     }()
 
-    /// Builds the engine from the stored rules of all lists. Returns the number of rules. Runs off the main thread.
-    nonisolated static func rebuild(lists: [String]) throws -> Int {
-        let rules = lists.compactMap { try? String(contentsOf: file(for: $0), encoding: .utf8) }.joined(separator: "\n")
+    nonisolated static func build(_ files: [URL], in folder: URL) throws -> WebExtension {
+        let rules = try files.map { try String(contentsOf: $0, encoding: .utf8) }.joined(separator: "\n")
         _ = try WebExtension(containerURL: folder).buildFilterEngine(rules: rules)
-        return rules.split(whereSeparator: \.isNewline).count
+        return try open(folder)
     }
 
     /// The scripts to run at document start in `page`, or nil when no rule applies. `top` is the page a frame sits in.

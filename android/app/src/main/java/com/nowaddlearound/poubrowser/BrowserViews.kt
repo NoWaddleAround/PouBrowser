@@ -64,3 +64,9 @@ internal fun Context.actionLabel(value: String, primary: Boolean = false, action
 }
 
 internal fun TextView.center() = apply { gravity = Gravity.CENTER }
+
+internal fun TextView.leadingIcon(symbol: Int, tint: Int = currentTextColor) = apply {
+    setCompoundDrawablesRelativeWithIntrinsicBounds(symbol, 0, 0, 0)
+    compoundDrawablePadding = context.dp(6)
+    compoundDrawableTintList = ColorStateList.valueOf(tint)
+}
